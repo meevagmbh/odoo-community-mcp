@@ -63,6 +63,9 @@ working immediately, also for this server. Remove it from your client configurat
 
 Domains use Odoo's prefix notation, e.g. `["|", ["name", "ilike", "acme"], ["email", "ilike", "@acme.com"]]`.
 Dotted paths such as `country_id.code` are allowed when every model on the path is in the allowlist.
+Relations to models outside the allowlist can only be compared by id, cannot be used for
+sorting, and their values come back as plain ids (without the related record's name).
+Without `fields`, results contain stored, non-binary, non-x2many fields (at most 100).
 
 ## For operators
 
@@ -110,7 +113,8 @@ reachable from the container. Users need keys with the default `rpc` scope.
 
 JSON lines on stdout, timestamps in UTC. Every tool call produces an audit event with the
 key fingerprint (first 8 hex chars of SHA-256), tool, model, outcome, Odoo status, result
-count and duration. API keys, request bodies and Odoo error texts are never logged.
+count and duration. API keys and Odoo error texts are never logged; request data is not
+logged either, except a short, truncated excerpt of input the server rejected.
 
 ```json
 {"ts": "2026-11-24T22:05:11.518+00:00", "level": "INFO", "logger": "odoo_mcp.audit", "event": "tool_call", "key_fp": "3f9a1c2b", "tool": "search_records", "model": "res.partner", "outcome": "ok", "odoo_status": 200, "result_count": 12, "duration_ms": 84}

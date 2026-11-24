@@ -2,7 +2,7 @@
 
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -28,7 +28,7 @@ from odoo_mcp.validation import (
     validate_order,
 )
 
-FIELD_ATTRIBUTES = ["type", "string", "relation", "required"]
+FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "store"]
 FIELDS_CACHE_SECONDS = 60.0
 FIELDS_CACHE_SIZE = 2_000
 
@@ -52,6 +52,9 @@ DOMAIN_HELP = """
 - Datetimes are UTC strings: `"2026-01-01 00:00:00"`.
 - Empty relations compare with false: `["user_id", "=", false]`.
 - Follow relations with dots, e.g. `partner_id.name`; every model on the path must be allowed.
+- Relations to models that are not allowed can only be compared by id:
+  `["user_id", "=", 7]`, `["user_id", "in", [7, 8]]`, `["user_id", "=", false]`.
+  Their values come back as plain ids.
 - Use get_fields first to learn the exact field names and types of a model.
 """.strip()
 
@@ -224,10 +227,10 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
                 "limit": validate_limit(limit),
                 "offset": validate_offset(offset),
             }
-            if (sort := validate_order(order, available)) is not None:
+            if (sort := validate_order(order, available, allowed)) is not None:
                 payload["order"] = sort
             records = await odoo.call(key, model, "search_read", payload)
-            return _records(records)
+            return _records(records, available, allowed)
 
         return await run(ctx, "search_records", model, action)
 
@@ -260,14 +263,26 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         async def action(key: str) -> RecordsResult:
             available = await fields_of(key, model)
             payload = {"ids": validate_ids(ids), "fields": validate_fields(fields, available)}
-            return _records(await odoo.call(key, model, "read", payload))
+            return _records(await odoo.call(key, model, "read", payload), available, allowed)
 
         return await run(ctx, "read_records", model, action)
 
 
-def _records(result: object) -> RecordsResult:
+def _records(result: object, available: FieldMap, allowed: Sequence[str]) -> RecordsResult:
     if not isinstance(result, list) or not all(isinstance(r, dict) for r in result):
         raise OdooError("Odoo returned an unexpected result.", 200)
+    # many2one values are [id, display_name]; the name belongs to the related model,
+    # so it is only shown when that model is allowlisted.
+    foreign = {
+        name
+        for name, meta in available.items()
+        if meta.get("type") == "many2one" and meta.get("relation") not in allowed
+    }
+    for record in result:
+        for name in foreign & record.keys():
+            value = record[name]
+            if isinstance(value, list) and value:
+                record[name] = value[0]
     return RecordsResult(records=result, count=len(result))
 
 

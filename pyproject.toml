@@ -47,9 +47,10 @@ build-backend = "uv_build"
 module-name = "odoo_mcp"
 
 [tool.uv]
-# Supply-chain cooldown: never resolve a release younger than this date.
-# Move it forward deliberately (at least 7 days behind "today") when updating.
-exclude-newer = "2026-11-17T00:00:00Z"
+# Supply-chain cooldown: never resolve a release younger than 7 days (matches Dependabot).
+# For an urgent security fix, override once per package with
+# `uv lock --upgrade-package <pkg> --exclude-newer-package <pkg>=<timestamp>` and say so in the PR.
+exclude-newer = "7 days"
 required-version = ">=0.13.8"
 
 [tool.ruff]

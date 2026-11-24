@@ -118,3 +118,25 @@ async def test_model_outside_allowlist(app: Any, seed: dict[str, Any]) -> None:
         result = await client.call_tool("search_records", {"model": "res.users"})
     assert result.is_error
     assert "not allowed" in result.content[0].text  # type: ignore[union-attr]
+
+
+async def test_default_fields_and_foreign_relations(app: Any, seed: dict[str, Any]) -> None:
+    async with running(app), mcp_client(app, seed["keys"]["alice"]) as client:
+        default = await client.call_tool(
+            "search_records", {"model": "res.partner", "domain": [["ref", "=", "mcp-shared"]]}
+        )
+        by_id = await client.call_tool(
+            "count_records", {"model": "res.partner", "domain": [["user_id", "=", False]]}
+        )
+        by_name = await client.call_tool(
+            "count_records", {"model": "res.partner", "domain": [["user_id", "ilike", "admin"]]}
+        )
+    assert not default.is_error, default.content
+    assert default.structured_content is not None
+    (record,) = default.structured_content["records"]
+    assert record["name"] == "MCP Shared Partner"
+    assert "image_1920" not in record
+    assert "child_ids" not in record
+    assert not by_id.is_error
+    assert by_name.is_error
+    assert "res.users" in by_name.content[0].text  # type: ignore[union-attr]

@@ -35,7 +35,13 @@ TERM_OPERATORS = frozenset(
     }
 )  # fmt: skip
 RELATIONAL_TYPES = frozenset({"many2one", "one2many", "many2many"})
-DEFAULT_EXCLUDED_TYPES = frozenset({"binary"})
+# Default field list: cheap, stored, scalar-ish fields only.
+DEFAULT_EXCLUDED_TYPES = frozenset(
+    {"binary", "one2many", "many2many", "html", "properties", "properties_definition"}
+)
+# Relations to non-allowlisted models may only be compared by id: a string value
+# would make Odoo search names in the foreign model, bypassing the allowlist.
+ID_ONLY_OPERATORS = frozenset({"=", "!=", "in", "not in"})
 
 Scalar = str | int | float | bool | None
 
@@ -89,8 +95,8 @@ def validate_fields(fields: Sequence[str] | None, available: FieldMap) -> list[s
         return [
             name
             for name, meta in available.items()
-            if meta.get("type") not in DEFAULT_EXCLUDED_TYPES
-        ]
+            if meta.get("type") not in DEFAULT_EXCLUDED_TYPES and meta.get("store", True)
+        ][:MAX_FIELDS]
     unique = list(dict.fromkeys(fields))
     if not unique:
         raise InputError("fields must not be empty; omit it to get the default fields")
@@ -104,7 +110,7 @@ def validate_fields(fields: Sequence[str] | None, available: FieldMap) -> list[s
     return unique
 
 
-def validate_order(order: str | None, available: FieldMap) -> str | None:
+def validate_order(order: str | None, available: FieldMap, allowed: Sequence[str]) -> str | None:
     if order is None:
         return None
     parts = [part.strip() for part in order.split(",")]
@@ -119,6 +125,12 @@ def validate_order(order: str | None, available: FieldMap) -> str | None:
                 "with fields of this model, separated by commas"
             )
         field, direction = match.group(1), match.group(2)
+        relation = available[field].get("relation")
+        if available[field].get("type") in RELATIONAL_TYPES and relation not in allowed:
+            # Odoo would sort by the related record's name, which belongs to another model.
+            raise InputError(
+                f"Cannot order by {field}: it points to model {relation}, which is not allowed"
+            )
         normalised.append(f"{field} {direction.lower()}" if direction else field)
     return ", ".join(normalised)
 
@@ -145,8 +157,30 @@ def _check_value(value: object) -> None:
     raise InputError("Domain values must be strings, numbers, booleans, null or lists of those")
 
 
+def _is_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_foreign_relation(path: str, relation: str, operator: str, value: object) -> None:
+    ids_ok = (
+        _is_id(value)
+        or value is False
+        or (isinstance(value, list | tuple) and all(_is_id(v) for v in value))
+    )
+    if operator not in ID_ONLY_OPERATORS or not ids_ok:
+        raise InputError(
+            f"Field {_short(path)} points to model {relation}, which is not allowed: "
+            "compare it by record id only (=, !=, in, not in with ids or false)"
+        )
+
+
 async def _check_path(
-    path: str, model: str, fields_of: FieldsLookup, allowed: Sequence[str]
+    path: str,
+    model: str,
+    fields_of: FieldsLookup,
+    allowed: Sequence[str],
+    operator: str,
+    value: object,
 ) -> None:
     segments = path.split(".")
     if len(segments) > MAX_PATH_HOPS + 1 or not all(_FIELD_NAME.fullmatch(s) for s in segments):
@@ -159,9 +193,11 @@ async def _check_path(
                 f"Unknown field {_short(segment)} on {current} in domain. "
                 "Use get_fields to see the available fields."
             )
-        if index == len(segments) - 1:
-            return
         relation = meta.get("relation")
+        if index == len(segments) - 1:
+            if meta.get("type") in RELATIONAL_TYPES and relation not in allowed:
+                _check_foreign_relation(path, str(relation), operator, value)
+            return
         if meta.get("type") not in RELATIONAL_TYPES or not isinstance(relation, str):
             raise InputError(f"Field {current}.{segment} is not relational; cannot follow it")
         if relation not in allowed:
@@ -206,7 +242,7 @@ async def validate_domain(
                 f"allowed: {', '.join(sorted(TERM_OPERATORS))}"
             )
         _check_value(value)
-        await _check_path(field, model, fields_of, allowed)
+        await _check_path(field, model, fields_of, allowed, operator, value)
         result.append([field, operator, list(value) if isinstance(value, tuple) else value])
     return result
 

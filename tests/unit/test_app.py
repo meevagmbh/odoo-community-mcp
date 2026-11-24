@@ -20,7 +20,7 @@ pytestmark = pytest.mark.anyio
 KEY_A = "a1" * 20
 KEY_B = "b2" * 20
 
-PARTNER_FIELDS = {
+PARTNER_FIELDS: dict[str, dict[str, Any]] = {
     "id": {"type": "integer", "string": "ID", "required": False},
     "name": {"type": "char", "string": "Name", "required": True},
     "email": {"type": "char", "string": "Email", "required": False},
@@ -31,6 +31,12 @@ PARTNER_FIELDS = {
         "required": False,
     },
     "image_1920": {"type": "binary", "string": "Image", "required": False},
+    "user_id": {
+        "type": "many2one",
+        "string": "Salesperson",
+        "relation": "res.users",
+        "required": False,
+    },
 }
 
 ROWS = {
@@ -237,7 +243,7 @@ async def test_get_fields_returns_reduced_metadata(make_app: AppFactory, odoo: F
         "required": False,
     }
     body = json.loads(odoo.requests[0].content)
-    assert body["attributes"] == ["type", "string", "relation", "required"]
+    assert body["attributes"] == ["type", "string", "relation", "required", "store"]
 
 
 async def test_search_records_passes_through_callers_key(
@@ -266,6 +272,21 @@ async def test_search_records_passes_through_callers_key(
         "offset": 0,
         "order": "name desc",
     }
+
+
+async def test_foreign_many2one_values_are_reduced_to_ids(
+    make_app: AppFactory, odoo: FakeOdoo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = {"id": 1, "name": "A", "user_id": [2, "Mitchell Admin"], "country_id": [57, "Germany"]}
+    monkeypatch.setitem(ROWS, KEY_A, [row])
+    async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "search_records", {"model": "res.partner", "fields": ["user_id", "country_id"]}
+        )
+    assert result.structured_content is not None
+    (record,) = result.structured_content["records"]
+    assert record["user_id"] == 2
+    assert record["country_id"] == [57, "Germany"]
 
 
 async def test_concurrent_users_only_see_their_own_data(
