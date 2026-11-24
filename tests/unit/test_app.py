@@ -2,16 +2,14 @@
 
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from typing import Any
 
 import anyio
 import httpx2
 import pytest
-from mcp import Client
-from mcp.client.streamable_http import streamable_http_client
-from starlette.types import ASGIApp
+from mcp_support import http, mcp_client, running
+from starlette.applications import Starlette
 
 from odoo_mcp.app import create_app
 from odoo_mcp.auth import key_fingerprint
@@ -92,37 +90,12 @@ def odoo() -> FakeOdoo:
     return FakeOdoo()
 
 
-@asynccontextmanager
-async def running(app: ASGIApp) -> AsyncIterator[ASGIApp]:
-    lifespan = app.router.lifespan_context  # type: ignore[attr-defined]
-    async with lifespan(app):
-        yield app
-
-
-def http(app: ASGIApp, headers: dict[str, str] | None = None) -> httpx2.AsyncClient:
-    return httpx2.AsyncClient(
-        transport=httpx2.ASGITransport(app=app),
-        base_url="http://mcp.test",
-        headers=headers or {},
-    )
-
-
-@asynccontextmanager
-async def mcp_client(app: ASGIApp, key: str) -> AsyncIterator[Client]:
-    client = http(app, {"Authorization": f"Bearer {key}"})
-    async with (
-        client,
-        Client(streamable_http_client("http://mcp.test/mcp", http_client=client)) as c,
-    ):
-        yield c
-
-
-AppFactory = Callable[..., ASGIApp]
+AppFactory = Callable[..., Starlette]
 
 
 @pytest.fixture
 def make_app(odoo: FakeOdoo) -> AppFactory:
-    def factory(**overrides: Any) -> ASGIApp:
+    def factory(**overrides: Any) -> Starlette:
         return create_app(settings(**overrides), odoo_transport=httpx2.MockTransport(odoo.handler))
 
     return factory
