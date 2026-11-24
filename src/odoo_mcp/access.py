@@ -6,6 +6,7 @@ caller's own rights on every call.
 Entries (from `ODOO_MODELS`, comma-separated):
   `res.partner`         read (default)
   `sale.order:rw`       read and write
+  `sale.order:rwd`      read, write and delete (exact model names only)
   `sale.*:rw`           every model whose name starts with `sale.`
 Exact entries win over wildcards; among wildcards the longest prefix wins.
 """
@@ -16,13 +17,17 @@ from enum import StrEnum
 
 _MODEL = r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+"
 _ENTRY = re.compile(
-    rf"^(?P<name>{_MODEL}|[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\.\*)(?::(?P<mode>r|rw))?$"
+    rf"^(?P<name>{_MODEL}|[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\.\*)(?::(?P<mode>r|rw|rwd))?$"
 )
 
 
 class Access(StrEnum):
     READ = "read"
     READ_WRITE = "read-write"
+    READ_WRITE_DELETE = "read-write-delete"
+
+
+_WRITE_LEVELS = frozenset({Access.READ_WRITE, Access.READ_WRITE_DELETE})
 
 
 class ModelAccess:
@@ -33,7 +38,9 @@ class ModelAccess:
         self._ordered = sorted(patterns.items(), key=lambda item: len(item[0]), reverse=True)
 
     @classmethod
-    def parse(cls, entries: Iterable[str], *, allow_write: bool) -> ModelAccess:
+    def parse(
+        cls, entries: Iterable[str], *, allow_write: bool, allow_delete: bool = False
+    ) -> ModelAccess:
         exact: dict[str, Access] = {}
         patterns: dict[str, Access] = {}
         for entry in entries:
@@ -41,10 +48,14 @@ class ModelAccess:
             if not match:
                 raise ValueError(
                     f"invalid ODOO_MODELS entry {entry!r}; use 'model', 'model:r', "
-                    "'model:rw' or 'prefix.*:rw'"
+                    "'model:rw', 'model:rwd' or 'prefix.*:rw'"
                 )
             name, mode = match.group("name"), match.group("mode") or "r"
-            access = Access.READ_WRITE if mode == "rw" and allow_write else Access.READ
+            if mode == "rwd" and name.endswith(".*"):
+                raise ValueError(
+                    f"ODOO_MODELS entry {entry!r}: delete needs an exact model name, not a wildcard"
+                )
+            access = _effective(mode, allow_write=allow_write, allow_delete=allow_delete)
             target, key = (patterns, name[:-1]) if name.endswith(".*") else (exact, name)
             if key in target:
                 raise ValueError(f"duplicate ODOO_MODELS entry for {name!r}")
@@ -65,10 +76,24 @@ class ModelAccess:
         return isinstance(model, str) and self.access(model) is not None
 
     def can_write(self, model: str) -> bool:
-        return self.access(model) is Access.READ_WRITE
+        return self.access(model) in _WRITE_LEVELS
+
+    def can_delete(self, model: str) -> bool:
+        return self.access(model) is Access.READ_WRITE_DELETE
 
     @property
     def any_writable(self) -> bool:
-        return (
-            Access.READ_WRITE in self.exact.values() or Access.READ_WRITE in self.patterns.values()
-        )
+        return any(a in _WRITE_LEVELS for a in (*self.exact.values(), *self.patterns.values()))
+
+    @property
+    def any_deletable(self) -> bool:
+        return Access.READ_WRITE_DELETE in self.exact.values()
+
+
+def _effective(mode: str, *, allow_write: bool, allow_delete: bool) -> Access:
+    """Configured mode capped by the master switches."""
+    if mode == "rwd" and allow_write and allow_delete:
+        return Access.READ_WRITE_DELETE
+    if mode in ("rw", "rwd") and allow_write:
+        return Access.READ_WRITE
+    return Access.READ

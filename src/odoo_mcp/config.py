@@ -29,9 +29,10 @@ class Settings(BaseSettings):
     )
     odoo_db: str = Field(min_length=1, max_length=63, pattern=r"^[A-Za-z0-9_.-]+$")
     odoo_models: CommaList = Field(
-        description="Comma-separated model allowlist: 'model', 'model:rw' or 'prefix.*:rw'"
+        description="Model allowlist: 'model', 'model:rw', 'model:rwd' or 'prefix.*:rw'"
     )
     odoo_mcp_allow_write: bool = False
+    odoo_mcp_allow_delete: bool = False
     odoo_timeout_seconds: float = Field(default=30, gt=0, le=300)
     odoo_allow_insecure_http: bool = False
     odoo_max_response_bytes: int = Field(default=10_000_000, gt=0)
@@ -68,8 +69,12 @@ class Settings(BaseSettings):
         return self
 
     def model_access(self) -> ModelAccess:
-        """Per-model access; `rw` entries only count when ODOO_MCP_ALLOW_WRITE is true."""
-        return ModelAccess.parse(self.odoo_models, allow_write=self.odoo_mcp_allow_write)
+        """Per-model access, capped by ODOO_MCP_ALLOW_WRITE and ODOO_MCP_ALLOW_DELETE."""
+        return ModelAccess.parse(
+            self.odoo_models,
+            allow_write=self.odoo_mcp_allow_write,
+            allow_delete=self.odoo_mcp_allow_delete,
+        )
 
     @property
     def odoo_base_url(self) -> str:

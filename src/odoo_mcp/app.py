@@ -109,10 +109,16 @@ def create_app(
     settings: Settings, *, odoo_transport: httpx2.AsyncBaseTransport | None = None
 ) -> Starlette:
     install_log_filters()
-    if not settings.odoo_mcp_allow_write and any(m.endswith(":rw") for m in settings.odoo_models):
+    modes = {m.rpartition(":")[2] for m in settings.odoo_models if ":" in m}
+    if not settings.odoo_mcp_allow_write and modes & {"rw", "rwd"}:
         logger.warning(
-            "ODOO_MODELS has ':rw' entries but ODOO_MCP_ALLOW_WRITE is false: "
+            "ODOO_MODELS has ':rw'/':rwd' entries but ODOO_MCP_ALLOW_WRITE is false: "
             "all models are read-only and no write tools are offered"
+        )
+    elif not settings.odoo_mcp_allow_delete and "rwd" in modes:
+        logger.warning(
+            "ODOO_MODELS has ':rwd' entries but ODOO_MCP_ALLOW_DELETE is false: "
+            "no delete tool is offered"
         )
     odoo = OdooClient(
         settings.odoo_base_url,

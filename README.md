@@ -24,8 +24,8 @@ sequenceDiagram
   account and no key is ever stored.
 - **One deployment for everyone.** Users only create an API key and configure their client.
 - **Selective access per model or app**: e.g. `sale.*` read-write, `account.*` read-only.
-  Writing is off unless the operator enables it. There is no delete tool and no generic
-  "call any method" tool.
+  Writing and deleting are off unless the operator enables them, deleting only for
+  explicitly named models. There is no generic "call any method" tool.
 - **Hardened**: model allowlist, strict validation of domains, fields, sort order and
   written values, per-key rate limit, no tracebacks to clients, keys never logged,
   minimal rootless container image with signed releases.
@@ -75,11 +75,15 @@ Every tool carries a title and all MCP behaviour hints, so clients can ask befor
 | `read_records` | `read` | Read records by id | yes | no | yes |
 | `create_record` | `create` | Create one record (writable models only) | no | no | no |
 | `update_records` | `write` | Set field values on up to 100 records (writable models only) | no | yes | yes |
+| `delete_records` | `unlink` | Permanently delete up to 20 records (`rwd` models only) | no | yes | yes |
 
 `create_record` and `update_records` exist only when `ODOO_MCP_ALLOW_WRITE=true` and at least
 one model is configured `rw`. They accept plain field types; many2many fields take link
 commands (`[4, id]`, `[3, id]`, `[6, 0, [ids]]`); one2many, binary and read-only fields are
-refused. Odoo's business messages (e.g. a missing required field) are passed on as their
+refused. `delete_records` exists only when `ODOO_MCP_ALLOW_DELETE=true` too and at least one
+model is configured `rwd`; its description tells clients to confirm with the user and to
+prefer archiving (`active` = false via `update_records`) where a model supports it.
+Odoo's business messages (e.g. a missing required field) are passed on as their
 first line, shortened; tracebacks never are.
 
 Domains use Odoo's prefix notation, e.g. `["|", ["name", "ilike", "acme"], ["email", "ilike", "@acme.com"]]`.
@@ -87,6 +91,16 @@ Dotted paths such as `country_id.code` are allowed when every model on the path 
 Relations to models outside the allowlist can only be compared by id, cannot be used for
 sorting, and their values come back as plain ids (without the related record's name).
 Without `fields`, results contain stored, non-binary, non-x2many fields (at most 100).
+
+## Resources
+
+For clients that let users attach context (e.g. Claude Desktop), two MCP resource templates
+expose the same data with the same per-user rights and allowlist:
+
+| URI | Content |
+|---|---|
+| `odoo://schema/{model}` | Fields of a model (type, label, relation, required, read-only) and this server's access level for it |
+| `odoo://record/{model}/{id}` | One record with its stored, non-binary fields, e.g. `odoo://record/sale.order/42` |
 
 ## For operators
 
@@ -116,7 +130,8 @@ buffering settings.
 | `ODOO_URL` | – (required) | Base URL of Odoo. Must be `https` unless `ODOO_ALLOW_INSECURE_HTTP=true`. |
 | `ODOO_DB` | – (required) | Database name, sent as `X-Odoo-Database`. Never taken from clients. |
 | `ODOO_MODELS` | – (required) | Comma-separated model allowlist with access per entry, see below. Other models are refused even if the user may use them in Odoo. |
-| `ODOO_MCP_ALLOW_WRITE` | `false` | Master switch for writing. While `false`, every `rw` entry counts as `r` and no write tools are offered. |
+| `ODOO_MCP_ALLOW_WRITE` | `false` | Master switch for writing. While `false`, every `rw`/`rwd` entry counts as `r` and no write tools are offered. |
+| `ODOO_MCP_ALLOW_DELETE` | `false` | Master switch for deleting (needs `ODOO_MCP_ALLOW_WRITE` too). While `false`, every `rwd` entry counts as `rw`. |
 | `ODOO_TIMEOUT_SECONDS` | `30` | Timeout per Odoo call. |
 | `ODOO_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` to Odoo, only for a trusted internal network. |
 | `ODOO_MAX_RESPONSE_BYTES` | `10000000` | Upper bound for one Odoo response. |
@@ -135,6 +150,7 @@ There is deliberately **no** setting for an Odoo API key.
 |---|---|
 | `res.partner` or `res.partner:r` | read |
 | `sale.order:rw` | read and write (needs `ODOO_MCP_ALLOW_WRITE=true`) |
+| `res.partner:rwd` | read, write and delete (needs both switches; exact model names only, no wildcards) |
 | `sale.*:rw` | every model whose name starts with `sale.` (the Sales app), read and write |
 | `account.*:r` | every `account.` model, read only |
 
@@ -189,7 +205,6 @@ gh attestation verify oci://ghcr.io/meevagmbh/odoo-community-mcp:<version> --rep
 
 ## Known limitations
 
-- **No deletes.** Records can be created and updated, never deleted.
 - **API keys instead of OAuth.** Each user holds an Odoo API key.
 - **SSO-only users.** Odoo asks for the password before it creates a key. Users without a
   password need another way to obtain one, e.g. a key issued by an administrator.

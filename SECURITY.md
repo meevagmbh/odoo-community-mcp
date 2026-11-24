@@ -43,8 +43,9 @@ Dependencies are monitored continuously by Dependabot alerts and security update
 - Keys are never stored or logged. Logs contain a short SHA-256 fingerprint only.
 - Requests without a well-formed `Authorization: Bearer` header are rejected with 401
   before any MCP processing.
-- Only allowlisted models are reachable, each as read or read-write. Writing is disabled
-  unless the operator enables it; there is no delete operation and no generic method call.
+- Only allowlisted models are reachable, each as read, read-write or read-write-delete.
+  Writing and deleting each need their own operator switch; deleting is only possible for
+  explicitly named models, at most 20 records per call. There is no generic method call.
 - Domains, field names, sort order, written values, limits and body sizes are validated;
   client-supplied Odoo `context` is never forwarded.
 - Odoo errors are mapped to fixed messages. Only for Odoo business errors (validation and

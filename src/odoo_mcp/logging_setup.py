@@ -38,10 +38,16 @@ class OmitToolErrorText(logging.Filter):
     client input, so only the tool name stays in the log; the audit event has the rest."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.msg == "Tool %r failed: %r" and isinstance(record.args, tuple):
-            record.msg = "Tool %r failed (details in the audit log)"
+        if record.msg in _REWRITES and isinstance(record.args, tuple):
+            record.msg = _REWRITES[record.msg]
             record.args = record.args[:1]
         return True
+
+
+_REWRITES = {
+    "Tool %r failed: %r": "Tool %r failed (details in the audit log)",
+    "Resource %r failed: %r": "Resource %r failed (details in the audit log)",
+}
 
 
 _SDK_TOOL_LOGGER = "mcp.server.mcpserver.server"

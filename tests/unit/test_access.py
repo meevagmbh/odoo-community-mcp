@@ -3,8 +3,12 @@ import pytest
 from odoo_mcp.access import Access, ModelAccess
 
 
-def make(spec: str, *, allow_write: bool = True) -> ModelAccess:
-    return ModelAccess.parse([part.strip() for part in spec.split(",")], allow_write=allow_write)
+def make(spec: str, *, allow_write: bool = True, allow_delete: bool = True) -> ModelAccess:
+    return ModelAccess.parse(
+        [part.strip() for part in spec.split(",")],
+        allow_write=allow_write,
+        allow_delete=allow_delete,
+    )
 
 
 def test_default_access_is_read() -> None:
@@ -60,6 +64,31 @@ def test_entries_for_listing() -> None:
     access = make("res.partner, sale.*:rw")
     assert access.exact == {"res.partner": Access.READ}
     assert access.patterns == {"sale.": Access.READ_WRITE}
+
+
+def test_delete_level() -> None:
+    access = make("res.partner:rwd, sale.order:rw")
+    assert access.access("res.partner") is Access.READ_WRITE_DELETE
+    assert access.can_write("res.partner")
+    assert access.can_delete("res.partner")
+    assert not access.can_delete("sale.order")
+    assert access.any_deletable
+
+
+def test_delete_switch_downgrades_to_write() -> None:
+    access = make("res.partner:rwd", allow_delete=False)
+    assert access.access("res.partner") is Access.READ_WRITE
+    assert not access.any_deletable
+
+
+def test_write_switch_off_downgrades_delete_to_read() -> None:
+    access = make("res.partner:rwd", allow_write=False)
+    assert access.access("res.partner") is Access.READ
+
+
+def test_delete_needs_an_exact_model_name() -> None:
+    with pytest.raises(ValueError, match="exact"):
+        make("sale.*:rwd")
 
 
 @pytest.mark.parametrize(
