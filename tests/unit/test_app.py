@@ -38,6 +38,13 @@ PARTNER_FIELDS: dict[str, dict[str, Any]] = {
         "required": False,
     },
     "state": {"type": "selection", "string": "State", "required": False, "readonly": True},
+    "company_name": {
+        "type": "char",
+        "string": "Company Name",
+        "required": False,
+        "readonly": False,
+        "related": "parent_id.name",
+    },
 }
 
 ROWS = {
@@ -268,7 +275,16 @@ async def test_get_fields_returns_reduced_metadata(make_app: AppFactory, odoo: F
         "readonly": False,
     }
     body = json.loads(odoo.requests[0].content)
-    assert body["attributes"] == ["type", "string", "relation", "required", "readonly", "store"]
+    assert body["attributes"] == [
+        "type",
+        "string",
+        "relation",
+        "required",
+        "readonly",
+        "store",
+        "related",
+    ]
+    assert fields["company_name"]["readonly"] is True
 
 
 async def test_search_records_passes_through_callers_key(
@@ -464,6 +480,8 @@ async def test_every_tool_is_fully_annotated(make_app: AppFactory) -> None:
         ):
             assert value is not None, tool.name
         assert hints.read_only_hint is (tool.name in READ_TOOLS), tool.name
+        assert hints.open_world_hint is False, tool.name
+        assert tool.title == hints.title, tool.name
     assert tools["create_record"].annotations.destructive_hint is False  # type: ignore[union-attr]
     assert tools["update_records"].annotations.destructive_hint is True  # type: ignore[union-attr]
     assert tools["update_records"].annotations.idempotent_hint is True  # type: ignore[union-attr]
@@ -548,12 +566,23 @@ async def test_write_audit_logs_field_names_not_values(
             "update_records",
             {"model": "res.partner", "ids": [1], "values": {"email": "secret@example.com"}},
         )
+        await client.call_tool(
+            "update_records",
+            {"model": "res.partner", "ids": [1], "values": {"x" * 500: "y"}},
+        )
+        await client.call_tool("create_record", {"model": "res.partner", "values": {"name": "N"}})
     events = [r.audit for r in caplog.records if r.name == "odoo_mcp.audit"]
-    write = next(e for e in events if e.get("tool") == "update_records")
-    assert write["outcome"] == "ok"
-    assert write["fields"] == ["email"]
-    assert write["result_count"] == 1
+    writes = [e for e in events if e.get("tool") == "update_records"]
+    assert writes[0]["outcome"] == "ok"
+    assert writes[0]["fields"] == ["email"]
+    assert writes[0]["record_ids"] == [1]
+    assert writes[0]["result_count"] == 1
+    assert writes[1]["outcome"] == "rejected"
+    assert "fields" not in writes[1]
+    create = next(e for e in events if e.get("tool") == "create_record")
+    assert create["record_ids"] == [42]
     assert "secret@example.com" not in json.dumps(events)
+    assert "x" * 100 not in json.dumps(events)
 
 
 async def test_list_models_falls_back_to_patterns(make_app: AppFactory, odoo: FakeOdoo) -> None:
@@ -587,3 +616,59 @@ async def test_write_business_error_reaches_client(make_app: AppFactory, odoo: F
     text = result.content[0].text  # type: ignore[union-attr]
     assert "The partner must have a name." in text
     assert "Traceback" not in text
+
+
+async def test_business_error_text_stays_out_of_logs(
+    make_app: AppFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    for name in ("", "mcp", "odoo_mcp"):
+        logging.getLogger(name).setLevel(logging.DEBUG)
+    caplog.set_level(logging.DEBUG)
+
+    async def reject(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith("/create"):
+            return httpx2.Response(
+                422,
+                json={"name": "odoo.exceptions.UserError", "message": "Customer Jane Roe blocked"},
+            )
+        return httpx2.Response(200, json=PARTNER_FIELDS)
+
+    app = create_app(settings(**WRITE_SETTINGS), odoo_transport=httpx2.MockTransport(reject))
+    async with running(app), mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "create_record", {"model": "res.partner", "values": {"name": "Jane"}}
+        )
+        rejected = await client.call_tool(
+            "search_records", {"model": "res.partner", "domain": [["secret_term", "=", 1]]}
+        )
+    assert "Jane Roe" in result.content[0].text  # type: ignore[union-attr]
+    assert rejected.is_error
+    log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Jane Roe" not in log
+
+
+@pytest.mark.parametrize("tool", ["create_record", "update_records"])
+async def test_write_timeout_says_outcome_unknown(tool: str) -> None:
+    async def slow(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path.endswith(("/create", "/write")):
+            raise httpx2.ReadTimeout("timed out", request=request)
+        return httpx2.Response(200, json=PARTNER_FIELDS)
+
+    app = create_app(settings(**WRITE_SETTINGS), odoo_transport=httpx2.MockTransport(slow))
+    arguments: dict[str, Any] = {"model": "res.partner", "values": {"name": "N"}}
+    if tool == "update_records":
+        arguments["ids"] = [1]
+    async with running(app), mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(tool, arguments)
+    assert result.is_error
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "unknown" in text
+    assert "before retrying" in text
+
+
+async def test_startup_warns_when_rw_is_switched_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    create_app(settings(odoo_models="res.partner:rw"))
+    assert any("ODOO_MCP_ALLOW_WRITE" in r.getMessage() for r in caplog.records)

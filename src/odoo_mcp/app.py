@@ -1,6 +1,7 @@
 """ASGI application: HTTP guard layer in front of a stateless MCP endpoint."""
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,10 +18,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from odoo_mcp.auth import extract_bearer, key_digest, key_fingerprint
 from odoo_mcp.config import Settings
-from odoo_mcp.logging_setup import audit
+from odoo_mcp.logging_setup import audit, install_log_filters
 from odoo_mcp.odoo_client import VERSION, OdooClient
 from odoo_mcp.ratelimit import RateLimiter
 from odoo_mcp.tools import register_tools
+
+logger = logging.getLogger(__name__)
 
 MCP_PATH = "/mcp"
 HEALTH_PATH = "/healthz"
@@ -105,6 +108,12 @@ async def healthz(_request: Request) -> Response:
 def create_app(
     settings: Settings, *, odoo_transport: httpx2.AsyncBaseTransport | None = None
 ) -> Starlette:
+    install_log_filters()
+    if not settings.odoo_mcp_allow_write and any(m.endswith(":rw") for m in settings.odoo_models):
+        logger.warning(
+            "ODOO_MODELS has ':rw' entries but ODOO_MCP_ALLOW_WRITE is false: "
+            "all models are read-only and no write tools are offered"
+        )
     odoo = OdooClient(
         settings.odoo_base_url,
         settings.odoo_db,

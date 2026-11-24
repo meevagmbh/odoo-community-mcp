@@ -23,6 +23,7 @@ FIELDS: dict[str, dict[str, Any]] = {
     "image": {"type": "binary"},
     "props": {"type": "properties"},
     "display_name": {"type": "char", "store": False, "readonly": True},
+    "company_name": {"type": "char", "related": "company_id.name", "readonly": False},
 }
 
 
@@ -56,6 +57,7 @@ def test_relations_can_be_cleared() -> None:
         ({"id": 5}, "read-only"),
         ({"state": "sale"}, "read-only"),
         ({"display_name": "x"}, "read-only"),
+        ({"company_name": "x"}, "related"),
         ({"order_line": [[0, 0, {"name": "x"}]]}, "one2many"),
         ({"image": "aGVsbG8="}, "binary"),
         ({"props": {}}, "properties"),

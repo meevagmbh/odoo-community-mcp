@@ -14,7 +14,7 @@ from odoo_mcp.access import Access, ModelAccess
 from odoo_mcp.auth import extract_bearer, key_digest, key_fingerprint
 from odoo_mcp.config import Settings
 from odoo_mcp.logging_setup import audit
-from odoo_mcp.odoo_client import OdooClient, OdooError
+from odoo_mcp.odoo_client import OdooClient, OdooError, OdooUnavailableError
 from odoo_mcp.validation import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -31,7 +31,7 @@ from odoo_mcp.validation import (
     validate_values,
 )
 
-FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "readonly", "store"]
+FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "readonly", "store", "related"]
 MAX_UPDATE_IDS = 100
 MAX_LISTED_MODELS = 200
 FIELDS_CACHE_SECONDS = 60.0
@@ -45,7 +45,8 @@ def _hints(title: str, *, read_only: bool, destructive: bool, idempotent: bool) 
         read_only_hint=read_only,
         destructive_hint=destructive,
         idempotent_hint=idempotent,
-        open_world_hint=True,  # talks to an external system (Odoo)
+        # Closed world: the tools only touch one configured Odoo database.
+        open_world_hint=False,
     )
 
 
@@ -161,7 +162,7 @@ class _Runner(Protocol):
         tool: str,
         model: str | None,
         action: Callable[[str], Awaitable[T]],
-        **extra: Any,
+        audit_extra: dict[str, Any] | None = None,
     ) -> T: ...
 
 
@@ -196,8 +197,10 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         tool: str,
         model: str | None,
         action: Callable[[str], Awaitable[T]],
-        **extra: Any,
+        audit_extra: dict[str, Any] | None = None,
     ) -> T:
+        """Run one tool call; `audit_extra` may be filled by the action (validated data only)."""
+        extra = audit_extra if audit_extra is not None else {}
         key = _caller_key(ctx)
         fingerprint = key_fingerprint(key)
         started = time.perf_counter()
@@ -243,18 +246,24 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
             return None
         return [r["model"] for r in rows if isinstance(r, dict) and isinstance(r.get("model"), str)]
 
-    @server.tool(annotations=_read("List allowed models"))
+    @server.tool(title="List allowed models", annotations=_read("List allowed models"))
     async def list_models(ctx: Context) -> ModelsResult:
         """List the Odoo models this gateway allows and whether each is read-only
-        ("read") or writable ("read-write"). Only these models can be used."""
+        ("read") or writable ("read-write"). Only these models can be used.
+
+        An entry ending in ".*" (e.g. "sale.*") stands for every model whose technical
+        name starts with that prefix, such as sale.order or sale.order.line; use the
+        concrete name in the other tools."""
 
         async def action(key: str) -> ModelsResult:
             entries = [ModelEntry(model=m, access=a) for m, a in allowed.exact.items()]
             seen = set(allowed.exact)
             for prefix, pattern_access in allowed.patterns.items():
                 names = await expand(key, prefix)
-                if names is None:
+                if names is None or len(names) >= MAX_LISTED_MODELS:
+                    # Not visible to this user, or too many to list: show the pattern.
                     entries.append(ModelEntry(model=f"{prefix}*", access=pattern_access))
+                if names is None:
                     continue
                 for name in names:
                     access = allowed.access(name)
@@ -265,7 +274,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "list_models", None, action)
 
-    @server.tool(annotations=_read("Describe model fields"))
+    @server.tool(title="Describe model fields", annotations=_read("Describe model fields"))
     async def get_fields(model: Model, ctx: Context) -> FieldsResult:
         """Describe the fields of an Odoo model: technical name, type, label, related
         model (for many2one/one2many/many2many), whether it is required and whether it
@@ -282,7 +291,8 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
                         label=str(meta.get("string", "")),
                         relation=meta.get("relation") or None,
                         required=bool(meta.get("required", False)),
-                        readonly=bool(meta.get("readonly", False)),
+                        # Related fields write elsewhere; this server refuses them.
+                        readonly=bool(meta.get("readonly", False) or meta.get("related")),
                     )
                     for name, meta in raw.items()
                 }
@@ -290,7 +300,11 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "get_fields", model, action)
 
-    @server.tool(annotations=_read("Search records"), description=_search_description())
+    @server.tool(
+        title="Search records",
+        annotations=_read("Search records"),
+        description=_search_description(),
+    )
     async def search_records(
         model: Model,
         ctx: Context,
@@ -322,7 +336,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "search_records", model, action)
 
-    @server.tool(annotations=_read("Count records"))
+    @server.tool(title="Count records", annotations=_read("Count records"))
     async def count_records(model: Model, ctx: Context, domain: Domain = None) -> CountResult:
         """Count the records of an Odoo model that match a domain (same syntax as
         search_records). Use it to size a result before fetching it."""
@@ -338,7 +352,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "count_records", model, action)
 
-    @server.tool(annotations=_read("Read records by id"))
+    @server.tool(title="Read records by id", annotations=_read("Read records by id"))
     async def read_records(
         model: Model,
         ids: Annotated[list[int], Field(description="Record ids, e.g. [7, 42] (max 500)")],
@@ -387,6 +401,19 @@ def _register_write_tools(
     fields_of: Callable[[str, str], Awaitable[FieldMap]],
     run: _Runner,
 ) -> None:
+    async def write(key: str, model: str, method: str, payload: dict[str, Any]) -> Any:
+        try:
+            return await odoo.call(key, model, method, payload)
+        except OdooUnavailableError as exc:
+            if exc.status is not None:
+                raise
+            # Timeout or broken connection: Odoo may have committed the change.
+            raise OdooUnavailableError(
+                f"No answer from Odoo for {model}.{method}: the outcome is unknown. "
+                "Search for the record before retrying, to avoid duplicates.",
+                None,
+            ) from exc
+
     def check_writable(model: str) -> None:
         if not allowed.can_write(model):
             raise InputError(
@@ -395,6 +422,7 @@ def _register_write_tools(
             )
 
     @server.tool(
+        title="Create record",
         annotations=_hints("Create record", read_only=False, destructive=False, idempotent=False),
         description=(
             "Create one record in an Odoo model that this server allows writing "
@@ -405,10 +433,13 @@ def _register_write_tools(
         ),
     )
     async def create_record(model: Model, values: Values, ctx: Context) -> CreateResult:
+        info: dict[str, Any] = {}
+
         async def action(key: str) -> CreateResult:
             check_writable(model)
             vals = validate_values(values, await fields_of(key, model))
-            result = await odoo.call(key, model, "create", {"vals_list": [vals]})
+            info["fields"] = sorted(vals)
+            result = await write(key, model, "create", {"vals_list": [vals]})
             if not (
                 isinstance(result, list)
                 and len(result) == 1
@@ -416,11 +447,13 @@ def _register_write_tools(
                 and not isinstance(result[0], bool)
             ):
                 raise OdooError("Odoo returned an unexpected create result.", 200)
+            info["record_ids"] = [result[0]]
             return CreateResult(id=result[0])
 
-        return await run(ctx, "create_record", model, action, fields=sorted(values))
+        return await run(ctx, "create_record", model, action, info)
 
     @server.tool(
+        title="Update records",
         annotations=_hints("Update records", read_only=False, destructive=True, idempotent=True),
         description=(
             "Write the same field values to existing records of an Odoo model that this "
@@ -437,18 +470,22 @@ def _register_write_tools(
         values: Values,
         ctx: Context,
     ) -> UpdateResult:
+        info: dict[str, Any] = {}
+
         async def action(key: str) -> UpdateResult:
             check_writable(model)
             unique = validate_ids(ids)
             if len(unique) > MAX_UPDATE_IDS:
                 raise InputError(f"update_records accepts at most {MAX_UPDATE_IDS} ids per call")
             vals = validate_values(values, await fields_of(key, model))
-            result = await odoo.call(key, model, "write", {"ids": unique, "vals": vals})
+            info["fields"] = sorted(vals)
+            info["record_ids"] = unique
+            result = await write(key, model, "write", {"ids": unique, "vals": vals})
             if result is not True:
                 raise OdooError("Odoo returned an unexpected write result.", 200)
             return UpdateResult(ids=unique, updated=len(unique))
 
-        return await run(ctx, "update_records", model, action, fields=sorted(values))
+        return await run(ctx, "update_records", model, action, info)
 
 
 def _records(result: object, available: FieldMap, allowed: Container[str]) -> RecordsResult:

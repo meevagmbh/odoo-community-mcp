@@ -148,7 +148,7 @@ def write_app(seed: dict[str, Any]) -> Any:
         {
             "odoo_url": os.environ["ODOO_IT_URL"],
             "odoo_db": "mcptest",
-            "odoo_models": "res.partner:rw,res.partner.category:rw,res.country",
+            "odoo_models": "res.partner:rw,res.partner.category:rw,res.country,res.country.*",
             "odoo_mcp_allow_write": True,
             "odoo_allow_insecure_http": True,
         }
@@ -221,5 +221,30 @@ async def test_business_errors_are_explained(write_app: Any, seed: dict[str, Any
         )
     assert result.is_error
     text = result.content[0].text  # type: ignore[union-attr]
+    assert "Odoo says:" in text
     assert "Traceback" not in text
     assert len(text) < 600
+
+
+async def test_wildcard_shown_as_pattern_without_ir_model_access(
+    write_app: Any, seed: dict[str, Any]
+) -> None:
+    # Odoo 19+ lets only "Access Rights" managers read ir.model, so for a normal user the
+    # wildcard stays a pattern; concrete names under it still work.
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        listed = await client.call_tool("list_models", {})
+        states = await client.call_tool(
+            "count_records",
+            {"model": "res.country.state", "domain": [["country_id.code", "=", "DE"]]},
+        )
+    assert listed.structured_content is not None
+    models = {m["model"]: m["access"] for m in listed.structured_content["models"]}
+    assert models == {
+        "res.partner": "read-write",
+        "res.partner.category": "read-write",
+        "res.country": "read",
+        "res.country.*": "read",
+    }
+    assert not states.is_error, states.content
+    assert states.structured_content is not None
+    assert states.structured_content["count"] > 0

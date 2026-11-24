@@ -138,6 +138,10 @@ There is deliberately **no** setting for an Odoo API key.
 | `sale.*:rw` | every model whose name starts with `sale.` (the Sales app), read and write |
 | `account.*:r` | every `account.` model, read only |
 
+`list_models` resolves wildcards into model names only for users who may read `ir.model`
+(in Odoo 19+ the "Access Rights" group); everyone else sees the pattern, e.g. `sale.*`, and
+uses concrete names such as `sale.order`.
+
 Exact entries win over wildcards, and longer wildcards win over shorter ones, so
 `sale.*:rw, sale.report:r` keeps the sales report read-only. The gateway can only narrow
 access: Odoo still checks every read and write against the user's own rights.

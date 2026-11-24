@@ -363,6 +363,13 @@ def validate_values(values: Mapping[str, object], available: FieldMap) -> dict[s
         kind = str(meta.get("type"))
         if meta.get("readonly") or name == "id":
             raise InputError(f"Field {name} is read-only and cannot be set")
+        if meta.get("related"):
+            # A related field writes into the record it points to, i.e. possibly into
+            # a model outside the allowlist.
+            raise InputError(
+                f"Field {name} is a related field ({meta['related']}); "
+                "write the source record instead"
+            )
         if kind not in WRITABLE_TYPES:
             raise InputError(f"Field {name} has type {kind}, which this server does not write")
         if not _value_ok(kind, value):
