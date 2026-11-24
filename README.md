@@ -136,9 +136,7 @@ gh attestation verify oci://ghcr.io/meevagmbh/odoo-community-mcp:<version> --rep
 ## Known limitations
 
 - **Read-only.** Write tools are planned behind an explicit switch and their own allowlist.
-  `unlink` will never be offered.
-- **API keys instead of OAuth.** MCP's OAuth flow against an identity provider is planned.
-  Until then each user holds an Odoo API key.
+- **API keys instead of OAuth.** Each user holds an Odoo API key.
 - **SSO-only users.** Odoo asks for the password before it creates a key. Users without a
   password need another way to obtain one, e.g. a key issued by an administrator.
 - **Rate limit per process.** With several replicas the effective limit multiplies.
@@ -155,7 +153,7 @@ docker build -t odoo-community-mcp:dev . && scripts/image-smoke-test.sh odoo-com
 ```
 
 With a local uv ≥ 0.13.8 and Python 3.15 the scripts use it directly.
-Commits follow [Conventional Commits](https://www.conventionalcommits.org).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, conventions and dependency policy.
 
 ### Releasing
 
