@@ -12,5 +12,5 @@ exec docker run --rm \
   -e UV_CACHE_DIR=/cache/uv \
   -e UV_PROJECT_ENVIRONMENT=/cache/venv \
   -e UV_PYTHON_DOWNLOADS=never \
-  ghcr.io/astral-sh/uv:0.13.8-python3.14-trixie-slim@sha256:81a1340fea1e72ad4a8e9a016128b0c61041cf182ea49fd788023e52842bc147 \
+  ghcr.io/astral-sh/uv:0.13.8-python3.15-trixie-slim@sha256:053efa9652f89ac056731b55b4912131fca1dd644d472b6a40340a62f183a5db \
   "$@"

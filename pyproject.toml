@@ -5,14 +5,14 @@ description = "Stateless MCP gateway for Odoo 20+ that passes each user's own AP
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.14"
+requires-python = ">=3.15"
 authors = [{ name = "meeva GmbH" }]
 keywords = ["mcp", "odoo", "model-context-protocol", "erp"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: AsyncIO",
   "Intended Audience :: System Administrators",
-  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Office/Business",
 ]
 dependencies = [
@@ -54,7 +54,7 @@ required-version = ">=0.13.8"
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py315"
 
 [tool.ruff.lint]
 select = [
@@ -68,12 +68,13 @@ ignore = ["TRY003"]
 
 [tool.mypy]
 strict = true
-python_version = "3.14"
+python_version = "3.15"
 packages = ["odoo_mcp"]
 mypy_path = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 addopts = "-ra --strict-markers --strict-config -m 'not integration'"
 markers = ["integration: needs a running Odoo 20 (see tests/integration/README.md)"]
 filterwarnings = ["error"]
