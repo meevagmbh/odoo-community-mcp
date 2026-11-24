@@ -1,11 +1,21 @@
 # odoo-community-mcp
 
 A stateless [Model Context Protocol](https://modelcontextprotocol.io) server for
-**Odoo 20+ (Community and Enterprise)**. It lets AI clients such as Claude Code or
-Claude Desktop read Odoo data — **with each user's own permissions**.
+**Odoo 19 and newer**. It lets AI clients such as Claude Code or Claude Desktop read
+Odoo data — **with each user's own permissions**.
 
-```
-MCP client ──Authorization: Bearer <your Odoo API key>──▶ odoo-community-mcp ──same key──▶ Odoo /json/2
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP client<br/>(Claude Code, Claude Desktop, …)
+    participant G as odoo-community-mcp
+    participant O as Odoo JSON-2 API
+    C->>G: tools/call search_records<br/>Authorization: Bearer (user's own API key)
+    G->>G: require bearer, rate limit per key,<br/>model allowlist, validate domain/fields/order
+    G->>O: POST /json/2/res.partner/search_read<br/>Authorization: bearer (same key)
+    O->>O: check key, access rights,<br/>record rules, field access
+    O-->>G: only records this user may see
+    G-->>C: records (never Odoo error texts or tracebacks)
 ```
 
 - **Per-user pass-through.** Every request carries the caller's own Odoo API key. The
@@ -106,8 +116,21 @@ buffering settings.
 
 There is deliberately **no** setting for an Odoo API key.
 
-Odoo requirements: version 20 or newer with the `rpc` module (auto-installed with `base`),
-reachable from the container. Users need keys with the default `rpc` scope.
+Odoo requirements: the `rpc` module (auto-installed with `base`), reachable from the
+container. Users need keys with the default `rpc` scope.
+
+### Supported Odoo versions
+
+| Odoo | Status | Checked |
+|---|---|---|
+| 19.0 | supported | every pull request and push (required check) |
+| 20.0 | supported | every pull request and push (required check) |
+| `odoo:latest` image | early warning | daily and on relevant pull requests, not blocking |
+| master (next, unreleased) | early warning | daily from the nightly build, not blocking |
+
+Versions before 19.0 lack the JSON-2 API and are not supported. Tests run against Odoo
+Community; Enterprise exposes the same JSON-2 API but is not tested here. A failing daily
+early-warning run opens an issue, so incompatibilities show up before a release.
 
 ### Logs
 
@@ -122,7 +145,7 @@ logged either, except a short, truncated excerpt of input the server rejected.
 
 ### Verify an image
 
-Releases are signed keylessly with Sigstore and carry SLSA provenance and SBOM attestations.
+Releases are signed keylessly with Sigstore (verify with cosign 3 or newer) and carry SLSA provenance and SBOM attestations.
 Each GitHub release also ships SBOMs (SPDX, CycloneDX) and `SHA256SUMS` as assets
 (see [SECURITY.md](SECURITY.md#release-evidence-eu-cyber-resilience-act)):
 
@@ -149,6 +172,8 @@ Requires Docker; Python 3.15 and uv are provided by a pinned container.
 git config core.hooksPath .githooks   # pre-commit: format+lint, pre-push: full checks
 scripts/check.sh                      # format, lint, mypy (strict), unit tests with coverage
 scripts/integration.sh                # throwaway Odoo 20 + two users, integration tests
+ODOO_IMAGE=odoo:19.0 scripts/integration.sh   # same against another Odoo image
+ODOO_IMAGE=master scripts/integration.sh      # same against Odoo master (nightly build)
 docker build -t odoo-community-mcp:dev . && scripts/image-smoke-test.sh odoo-community-mcp:dev
 ```
 

@@ -25,7 +25,7 @@ other command with `scripts/dev.sh` to run it in the container, e.g.
 | Command | What it does |
 |---|---|
 | `scripts/check.sh` | Same checks as CI: `ruff format --check`, `ruff check`, `mypy`, `pytest --cov` (≥ 90 %) |
-| `scripts/integration.sh` | Starts a throwaway Odoo 20 + PostgreSQL, seeds two users with API keys, runs `tests/integration` |
+| `scripts/integration.sh` | Starts a throwaway Odoo (20 by default, `ODOO_IMAGE=odoo:19.0` or `master` for others) + PostgreSQL, seeds two users with API keys, runs `tests/integration` |
 | `docker build -t odoo-community-mcp:dev . && scripts/image-smoke-test.sh odoo-community-mcp:dev` | Builds the image and checks it runs read-only, non-root, without a shell |
 | `scripts/dev.sh uv run ruff format .` | Formats the code (CI only checks, it never rewrites) |
 

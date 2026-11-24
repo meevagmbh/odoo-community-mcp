@@ -1,4 +1,4 @@
-"""Integration tests against a real Odoo 20 (run via scripts/integration.sh)."""
+"""Integration tests against a real Odoo 19+ (run via scripts/integration.sh)."""
 
 import json
 import os

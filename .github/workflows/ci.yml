@@ -51,9 +51,16 @@ jobs:
       - run: uv run pytest --cov --cov-report=term-missing
 
   integration:
-    name: Integration tests (Odoo 20)
+    # Supported Odoo versions. Floating series tags on purpose: every run tests the
+    # newest patch release of each series. Early warnings for odoo:latest and
+    # Odoo master run in odoo-compatibility.yml.
+    name: Integration tests (Odoo ${{ matrix.odoo }})
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        odoo: ["19.0", "20.0"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -66,6 +73,7 @@ jobs:
       - run: scripts/integration.sh
         env:
           RUNNER: uv run
+          ODOO_IMAGE: odoo:${{ matrix.odoo }}
 
   audit:
     name: Dependency audit
