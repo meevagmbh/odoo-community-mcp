@@ -1,0 +1,71 @@
+name: Odoo compatibility
+
+# Early warning: run the integration tests against Odoo versions that are not
+# (yet) supported. `latest` is the newest released Docker image, `master` the
+# next, unreleased Odoo built from the nightly .deb. Failures here do not block
+# merges; a scheduled failure opens (or updates) an issue.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/integration/**"
+      - "scripts/integration.sh"
+      - ".github/workflows/odoo-compatibility.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odoo-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Odoo ${{ matrix.odoo }} (early warning)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        odoo: [latest, master]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.8"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Integration tests
+        run: scripts/integration.sh
+        env:
+          RUNNER: uv run
+          ODOO_IMAGE: ${{ matrix.odoo == 'master' && 'master' || 'odoo:latest' }}
+
+  report:
+    name: Report scheduled failures
+    needs: integration
+    if: failure() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write # open or update the compatibility issue
+    steps:
+      - name: Open or update issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Odoo compatibility check failing"
+          body="The scheduled integration run against \`odoo:latest\` and/or Odoo \`master\` failed: $RUN_URL"
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

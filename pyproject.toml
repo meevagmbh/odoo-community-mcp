@@ -1,7 +1,7 @@
 [project]
 name = "odoo-community-mcp"
 version = "0.1.0"
-description = "Stateless MCP gateway for Odoo 20+ that passes each user's own API key through to the JSON-2 API."
+description = "Stateless MCP gateway for Odoo 19+ that passes each user's own API key through to the JSON-2 API."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -77,7 +77,7 @@ mypy_path = "src"
 testpaths = ["tests"]
 pythonpath = ["tests"]
 addopts = "-ra --strict-markers --strict-config -m 'not integration'"
-markers = ["integration: needs a running Odoo 20 (see tests/integration/README.md)"]
+markers = ["integration: needs a running Odoo (see scripts/integration.sh)"]
 filterwarnings = ["error"]
 
 [tool.coverage.run]

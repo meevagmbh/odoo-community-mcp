@@ -5,11 +5,13 @@ services:
   db:
     image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     environment:
-      POSTGRES_USER: odoo
-      POSTGRES_PASSWORD: odoo
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-odoo-role.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'odoo'\" | grep -q 1"]
       interval: 2s
       timeout: 3s
       retries: 30

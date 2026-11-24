@@ -2,8 +2,14 @@
 # Start a throwaway Odoo 20, seed two users with API keys, run the integration tests.
 # Usage: scripts/integration.sh            (tests run via scripts/dev.sh)
 #        RUNNER="uv run" scripts/integration.sh   (tests run with a local uv, e.g. in CI)
+#        ODOO_IMAGE=odoo:19.0 scripts/integration.sh   (another Odoo image)
+#        ODOO_IMAGE=master scripts/integration.sh      (build Odoo master from the nightly .deb)
 set -eu
 cd "$(dirname "$0")/.."
+if [ "${ODOO_IMAGE:-}" = master ]; then
+  docker build -q ${MASTER_BUILD_FLAGS---no-cache} -t odoo-community-mcp-it/odoo:master -f tests/integration/odoo-master.Dockerfile tests/integration >/dev/null
+  export ODOO_IMAGE=odoo-community-mcp-it/odoo:master
+fi
 compose="docker compose -f tests/integration/compose.yaml"
 port="${ODOO_PORT:-18069}"
 export ODOO_PORT="$port"

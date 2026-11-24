@@ -12,18 +12,42 @@ shared = env["res.partner"].create(
 )
 secret = env["res.partner"].create({"name": "MCP Alice Only", "ref": "mcp-alice-only"})
 
-# Odoo 20 models access as `ir.access`: a group-bound record grants a permission
-# limited to its domain. Bob (portal) may read every partner except alice-only ones.
+# Bob may read every partner except alice-only ones. Odoo 20 models this as one
+# group-bound `ir.access` record; Odoo 19 needs an ACL plus a group record rule.
 restricted = env["res.groups"].create({"name": "MCP Restricted Readers"})
-env["ir.access"].create(
-    {
-        "name": "MCP restricted readers: partners except alice-only",
-        "model_id": env.ref("base.model_res_partner").id,
-        "group_id": restricted.id,
-        "operation": "r",
-        "domain": "[('ref', '!=', 'mcp-alice-only')]",
-    }
-)
+partner_model = env.ref("base.model_res_partner").id
+not_alice_only = "[('ref', '!=', 'mcp-alice-only')]"
+if "ir.access" in env:
+    env["ir.access"].create(
+        {
+            "name": "MCP restricted readers: partners except alice-only",
+            "model_id": partner_model,
+            "group_id": restricted.id,
+            "operation": "r",
+            "domain": not_alice_only,
+        }
+    )
+else:
+    env["ir.model.access"].create(
+        {
+            "name": "MCP restricted readers: read partners",
+            "model_id": partner_model,
+            "group_id": restricted.id,
+            "perm_read": True,
+        }
+    )
+    env["ir.rule"].create(
+        {
+            "name": "MCP restricted readers: partners except alice-only",
+            "model_id": partner_model,
+            "groups": [(6, 0, [restricted.id])],
+            "domain_force": not_alice_only,
+            "perm_read": True,
+            "perm_write": False,
+            "perm_create": False,
+            "perm_unlink": False,
+        }
+    )
 
 alice = env["res.users"].create(
     {"name": "Alice", "login": "alice", "group_ids": [(6, 0, [env.ref("base.group_user").id])]}

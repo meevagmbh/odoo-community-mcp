@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM cgr.dev/chainguard/python:latest@sha256:3a89a9027f47e44e9f9da201493013249a02fc87fa7269bba80f621d7ade83f8
 
 LABEL org.opencontainers.image.title="odoo-community-mcp" \
-      org.opencontainers.image.description="Stateless MCP gateway for Odoo 20+ (per-user API key pass-through)" \
+      org.opencontainers.image.description="Stateless MCP gateway for Odoo 19+ (per-user API key pass-through)" \
       org.opencontainers.image.source="https://github.com/meevagmbh/odoo-community-mcp" \
       org.opencontainers.image.licenses="MIT"
 
