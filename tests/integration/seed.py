@@ -49,8 +49,10 @@ else:
         }
     )
 
+# Alice: internal user who may also create contacts (needed for the write tests).
+alice_groups = [env.ref("base.group_user").id, env.ref("base.group_partner_manager").id]
 alice = env["res.users"].create(
-    {"name": "Alice", "login": "alice", "group_ids": [(6, 0, [env.ref("base.group_user").id])]}
+    {"name": "Alice", "login": "alice", "group_ids": [(6, 0, alice_groups)]}
 )
 bob = env["res.users"].create(
     {

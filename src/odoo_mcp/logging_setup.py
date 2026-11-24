@@ -33,6 +33,27 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, default=str)
 
 
+class OmitToolErrorText(logging.Filter):
+    """The MCP SDK logs each tool error's text. Ours can quote Odoo business messages or
+    client input, so only the tool name stays in the log; the audit event has the rest."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg == "Tool %r failed: %r" and isinstance(record.args, tuple):
+            record.msg = "Tool %r failed (details in the audit log)"
+            record.args = record.args[:1]
+        return True
+
+
+_SDK_TOOL_LOGGER = "mcp.server.mcpserver.server"
+_tool_error_filter = OmitToolErrorText()
+
+
+def install_log_filters() -> None:
+    logger = logging.getLogger(_SDK_TOOL_LOGGER)
+    if _tool_error_filter not in logger.filters:
+        logger.addFilter(_tool_error_filter)
+
+
 def configure_logging(level: str) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())

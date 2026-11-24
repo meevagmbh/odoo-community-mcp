@@ -2,7 +2,7 @@
 
 A stateless [Model Context Protocol](https://modelcontextprotocol.io) server for
 **Odoo 19 and newer**. It lets AI clients such as Claude Code or Claude Desktop read
-Odoo data — **with each user's own permissions**.
+and, where allowed, write Odoo data — **with each user's own permissions**.
 
 ```mermaid
 sequenceDiagram
@@ -23,10 +23,11 @@ sequenceDiagram
   and Odoo enforces access rights, record rules and field access. There is no service
   account and no key is ever stored.
 - **One deployment for everyone.** Users only create an API key and configure their client.
-- **Read-only** in this version: `list_models`, `get_fields`, `search_records`,
-  `count_records`, `read_records`. There is no generic "call any method" tool.
-- **Hardened**: model allowlist, strict validation of domains, fields and sort order,
-  per-key rate limit, no Odoo error details or tracebacks to clients, keys never logged,
+- **Selective access per model or app**: e.g. `sale.*` read-write, `account.*` read-only.
+  Writing is off unless the operator enables it. There is no delete tool and no generic
+  "call any method" tool.
+- **Hardened**: model allowlist, strict validation of domains, fields, sort order and
+  written values, per-key rate limit, no tracebacks to clients, keys never logged,
   minimal rootless container image with signed releases.
 
 ## For users
@@ -63,13 +64,23 @@ working immediately, also for this server. Remove it from your client configurat
 
 ## Tools
 
-| Tool | Odoo method | Purpose |
-|---|---|---|
-| `list_models` | – | Models this deployment allows (`ODOO_MODELS`) |
-| `get_fields` | `fields_get` | Field names, types, labels, relations, required flag |
-| `search_records` | `search_read` | Search with `domain`, `fields`, `limit` (default 50, max 500), `offset`, `order` |
-| `count_records` | `search_count` | Count matches of a domain |
-| `read_records` | `read` | Read records by id |
+Every tool carries a title and all MCP behaviour hints, so clients can ask before writes:
+
+| Tool | Odoo method | Purpose | read-only | destructive | idempotent |
+|---|---|---|---|---|---|
+| `list_models` | (`ir.model` for wildcards) | Allowed models and their access (`read` / `read-write`) | yes | no | yes |
+| `get_fields` | `fields_get` | Field names, types, labels, relations, required and read-only flags | yes | no | yes |
+| `search_records` | `search_read` | Search with `domain`, `fields`, `limit` (default 50, max 500), `offset`, `order` | yes | no | yes |
+| `count_records` | `search_count` | Count matches of a domain | yes | no | yes |
+| `read_records` | `read` | Read records by id | yes | no | yes |
+| `create_record` | `create` | Create one record (writable models only) | no | no | no |
+| `update_records` | `write` | Set field values on up to 100 records (writable models only) | no | yes | yes |
+
+`create_record` and `update_records` exist only when `ODOO_MCP_ALLOW_WRITE=true` and at least
+one model is configured `rw`. They accept plain field types; many2many fields take link
+commands (`[4, id]`, `[3, id]`, `[6, 0, [ids]]`); one2many, binary and read-only fields are
+refused. Odoo's business messages (e.g. a missing required field) are passed on as their
+first line, shortened; tracebacks never are.
 
 Domains use Odoo's prefix notation, e.g. `["|", ["name", "ilike", "acme"], ["email", "ilike", "@acme.com"]]`.
 Dotted paths such as `country_id.code` are allowed when every model on the path is in the allowlist.
@@ -86,7 +97,8 @@ docker run -d --name odoo-mcp \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   -e ODOO_URL=https://odoo.example.com \
   -e ODOO_DB=mydb \
-  -e ODOO_MODELS=res.partner,sale.order,account.move \
+  -e ODOO_MODELS='res.partner, sale.*:rw, account.*:r' \
+  -e ODOO_MCP_ALLOW_WRITE=true \
   -e MCP_ALLOWED_HOSTS=odoo-mcp.example.com \
   -p 127.0.0.1:8000:8000 \
   ghcr.io/meevagmbh/odoo-community-mcp:latest
@@ -103,7 +115,8 @@ buffering settings.
 |---|---|---|
 | `ODOO_URL` | – (required) | Base URL of Odoo. Must be `https` unless `ODOO_ALLOW_INSECURE_HTTP=true`. |
 | `ODOO_DB` | – (required) | Database name, sent as `X-Odoo-Database`. Never taken from clients. |
-| `ODOO_MODELS` | – (required) | Comma-separated model allowlist. Other models are refused even if the user may read them in Odoo. |
+| `ODOO_MODELS` | – (required) | Comma-separated model allowlist with access per entry, see below. Other models are refused even if the user may use them in Odoo. |
+| `ODOO_MCP_ALLOW_WRITE` | `false` | Master switch for writing. While `false`, every `rw` entry counts as `r` and no write tools are offered. |
 | `ODOO_TIMEOUT_SECONDS` | `30` | Timeout per Odoo call. |
 | `ODOO_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` to Odoo, only for a trusted internal network. |
 | `ODOO_MAX_RESPONSE_BYTES` | `10000000` | Upper bound for one Odoo response. |
@@ -115,6 +128,23 @@ buffering settings.
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 
 There is deliberately **no** setting for an Odoo API key.
+
+#### Model access (`ODOO_MODELS`)
+
+| Entry | Meaning |
+|---|---|
+| `res.partner` or `res.partner:r` | read |
+| `sale.order:rw` | read and write (needs `ODOO_MCP_ALLOW_WRITE=true`) |
+| `sale.*:rw` | every model whose name starts with `sale.` (the Sales app), read and write |
+| `account.*:r` | every `account.` model, read only |
+
+`list_models` resolves wildcards into model names only for users who may read `ir.model`
+(in Odoo 19+ the "Access Rights" group); everyone else sees the pattern, e.g. `sale.*`, and
+uses concrete names such as `sale.order`.
+
+Exact entries win over wildcards, and longer wildcards win over shorter ones, so
+`sale.*:rw, sale.report:r` keeps the sales report read-only. The gateway can only narrow
+access: Odoo still checks every read and write against the user's own rights.
 
 Odoo requirements: the `rpc` module (auto-installed with `base`), reachable from the
 container. Users need keys with the default `rpc` scope.
@@ -136,7 +166,8 @@ early-warning run opens an issue, so incompatibilities show up before a release.
 
 JSON lines on stdout, timestamps in UTC. Every tool call produces an audit event with the
 key fingerprint (first 8 hex chars of SHA-256), tool, model, outcome, Odoo status, result
-count and duration. API keys and Odoo error texts are never logged; request data is not
+count and duration; writes also log the names (not the values) of the written fields.
+API keys and Odoo error texts are never logged; request data is not
 logged either, except a short, truncated excerpt of input the server rejected.
 
 ```json
@@ -158,7 +189,7 @@ gh attestation verify oci://ghcr.io/meevagmbh/odoo-community-mcp:<version> --rep
 
 ## Known limitations
 
-- **Read-only.** Write tools are planned behind an explicit switch and their own allowlist.
+- **No deletes.** Records can be created and updated, never deleted.
 - **API keys instead of OAuth.** Each user holds an Odoo API key.
 - **SSO-only users.** Odoo asks for the password before it creates a key. Users without a
   password need another way to obtain one, e.g. a key issued by an administrator.

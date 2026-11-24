@@ -186,3 +186,24 @@ async def test_oversized_response_is_rejected() -> None:
     )
     with pytest.raises(OdooUnavailableError, match="too large"):
         await client.call(KEY, "res.partner", "search_read", {})
+
+
+@pytest.mark.parametrize("name", ["odoo.exceptions.ValidationError", "odoo.exceptions.UserError"])
+async def test_business_error_message_is_passed_on_sanitised(name: str) -> None:
+    message = "Missing required fields: Customer\nTraceback (most recent call last): x" + "y" * 600
+    client = make_client(lambda _request: odoo_error(422, name, message))
+    with pytest.raises(OdooInvalidRequestError) as exc_info:
+        await client.call(KEY, "sale.order", "create", {})
+    text = str(exc_info.value)
+    assert "Missing required fields: Customer" in text
+    assert "Traceback" not in text
+    assert "SECRET-SQL" not in text
+    assert len(text) < 400
+
+
+async def test_business_error_message_redacts_bearer_tokens() -> None:
+    message = f"Invalid header bearer {KEY}"
+    client = make_client(lambda _request: odoo_error(422, "odoo.exceptions.UserError", message))
+    with pytest.raises(OdooInvalidRequestError) as exc_info:
+        await client.call(KEY, "sale.order", "write", {})
+    assert KEY not in str(exc_info.value)

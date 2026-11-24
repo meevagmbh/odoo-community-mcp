@@ -21,6 +21,15 @@ def test_parses_model_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.odoo_models == ("res.partner", "sale.order", "account.move")
 
 
+def test_model_access_and_write_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = make(monkeypatch, ODOO_MODELS="res.partner, sale.*:rw")
+    assert not settings.odoo_mcp_allow_write
+    assert not settings.model_access().can_write("sale.order")
+    enabled = make(monkeypatch, ODOO_MODELS="res.partner, sale.*:rw", ODOO_MCP_ALLOW_WRITE="true")
+    assert enabled.model_access().can_write("sale.order")
+    assert not enabled.model_access().can_write("res.partner")
+
+
 def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = make(monkeypatch)
     assert settings.odoo_timeout_seconds == 30
@@ -45,7 +54,9 @@ def test_plain_http_to_odoo_can_be_allowed_explicitly(monkeypatch: pytest.Monkey
     assert settings.odoo_base_url == "http://odoo:8069"
 
 
-@pytest.mark.parametrize("models", ["", " , ", "res.partner,Bad Model", "res.partner;drop"])
+@pytest.mark.parametrize(
+    "models", ["", " , ", "res.partner,Bad Model", "res.partner;drop", "res.partner:x", "*:rw"]
+)
 def test_invalid_model_allowlist_is_rejected(monkeypatch: pytest.MonkeyPatch, models: str) -> None:
     with pytest.raises(ValidationError):
         make(monkeypatch, ODOO_MODELS=models)

@@ -140,3 +140,111 @@ async def test_default_fields_and_foreign_relations(app: Any, seed: dict[str, An
     assert not by_id.is_error
     assert by_name.is_error
     assert "res.users" in by_name.content[0].text  # type: ignore[union-attr]
+
+
+@pytest.fixture
+def write_app(seed: dict[str, Any]) -> Any:
+    settings = Settings.model_validate(
+        {
+            "odoo_url": os.environ["ODOO_IT_URL"],
+            "odoo_db": "mcptest",
+            "odoo_models": "res.partner:rw,res.partner.category:rw,res.country,res.country.*",
+            "odoo_mcp_allow_write": True,
+            "odoo_allow_insecure_http": True,
+        }
+    )
+    return create_app(settings)
+
+
+async def test_create_update_and_link(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        tag = await client.call_tool(
+            "create_record", {"model": "res.partner.category", "values": {"name": "MCP Tag"}}
+        )
+        assert not tag.is_error, tag.content
+        assert tag.structured_content is not None
+        tag_id = tag.structured_content["id"]
+
+        created = await client.call_tool(
+            "create_record",
+            {"model": "res.partner", "values": {"name": "MCP Created", "ref": "mcp-created"}},
+        )
+        assert not created.is_error, created.content
+        assert created.structured_content is not None
+        partner_id = created.structured_content["id"]
+
+        updated = await client.call_tool(
+            "update_records",
+            {
+                "model": "res.partner",
+                "ids": [partner_id],
+                "values": {"email": "created@example.com", "category_id": [[4, tag_id]]},
+            },
+        )
+        assert not updated.is_error, updated.content
+
+        read = await client.call_tool(
+            "read_records",
+            {"model": "res.partner", "ids": [partner_id], "fields": ["email", "category_id"]},
+        )
+    assert read.structured_content is not None
+    (record,) = read.structured_content["records"]
+    assert record["email"] == "created@example.com"
+    assert record["category_id"] == [tag_id]
+
+
+async def test_odoo_still_enforces_rights_on_writes(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["bob"]) as client:
+        result = await client.call_tool(
+            "update_records",
+            {"model": "res.partner", "ids": [seed["shared_id"]], "values": {"email": "x@x.de"}},
+        )
+    assert result.is_error
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "permission" in text
+    assert "Traceback" not in text
+
+
+async def test_read_only_model_cannot_be_written(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        result = await client.call_tool(
+            "create_record", {"model": "res.country", "values": {"name": "Atlantis"}}
+        )
+    assert result.is_error
+    assert "read-only" in result.content[0].text  # type: ignore[union-attr]
+
+
+async def test_business_errors_are_explained(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        result = await client.call_tool(
+            "create_record", {"model": "res.partner", "values": {"email": "no-name@example.com"}}
+        )
+    assert result.is_error
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "Odoo says:" in text
+    assert "Traceback" not in text
+    assert len(text) < 600
+
+
+async def test_wildcard_shown_as_pattern_without_ir_model_access(
+    write_app: Any, seed: dict[str, Any]
+) -> None:
+    # Odoo 19+ lets only "Access Rights" managers read ir.model, so for a normal user the
+    # wildcard stays a pattern; concrete names under it still work.
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        listed = await client.call_tool("list_models", {})
+        states = await client.call_tool(
+            "count_records",
+            {"model": "res.country.state", "domain": [["country_id.code", "=", "DE"]]},
+        )
+    assert listed.structured_content is not None
+    models = {m["model"]: m["access"] for m in listed.structured_content["models"]}
+    assert models == {
+        "res.partner": "read-write",
+        "res.partner.category": "read-write",
+        "res.country": "read",
+        "res.country.*": "read",
+    }
+    assert not states.is_error, states.content
+    assert states.structured_content is not None
+    assert states.structured_content["count"] > 0
