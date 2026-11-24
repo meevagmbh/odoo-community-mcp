@@ -7,6 +7,7 @@ Odoo error bodies (message, arguments, traceback) never leave this module.
 
 import json
 import logging
+import re
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
@@ -48,6 +49,25 @@ class OdooInvalidRequestError(OdooError):
 
 class OdooUnavailableError(OdooError):
     pass
+
+
+# Business errors (missing required field, constraint violated) are meant for users,
+# and a client cannot fix a write without them. Only their first line goes out,
+# truncated and with anything token-like removed; tracebacks never do.
+_BUSINESS_ERRORS = frozenset({"odoo.exceptions.ValidationError", "odoo.exceptions.UserError"})
+_MAX_BUSINESS_MESSAGE = 300
+_TOKENISH = re.compile(r"(bearer\s+)?[A-Za-z0-9\-._~+/]{24,}=*", re.IGNORECASE)
+
+
+def _business_message(body: object) -> str | None:
+    if not isinstance(body, dict) or body.get("name") not in _BUSINESS_ERRORS:
+        return None
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return None
+    first = message.strip().splitlines()[0]
+    first = _TOKENISH.sub("[REDACTED]", first)
+    return first[:_MAX_BUSINESS_MESSAGE]
 
 
 _BY_NAME: dict[str, type[OdooError]] = {
@@ -153,11 +173,15 @@ class OdooClient:
                     _message(OdooUnavailableError, model, method), status
                 ) from exc
 
-        kind = self._classify(status, body)
+        parsed = self._parse(body)
+        kind = self._classify(status, parsed)
         logger.info(
             "Odoo call %s.%s failed with HTTP %s (%s)", model, method, status, kind.__name__
         )
-        raise kind(_message(kind, model, method), status)
+        message = _message(kind, model, method)
+        if kind is OdooInvalidRequestError and (detail := _business_message(parsed)):
+            message = f"{message} Odoo says: {detail}"
+        raise kind(message, status)
 
     async def _read_body(self, response: httpx2.Response) -> bytes:
         chunks: list[bytes] = []
@@ -176,14 +200,15 @@ class OdooClient:
         return b"".join(chunks)
 
     @staticmethod
-    def _classify(status: int, body: bytes) -> type[OdooError]:
-        name: object = None
+    def _parse(body: bytes) -> object:
         try:
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                name = parsed.get("name")
+            return json.loads(body)
         except ValueError:
-            pass
+            return None
+
+    @staticmethod
+    def _classify(status: int, parsed: object) -> type[OdooError]:
+        name = parsed.get("name") if isinstance(parsed, dict) else None
         if isinstance(name, str) and name in _BY_NAME:
             return _BY_NAME[name]
         return _BY_STATUS.get(status, OdooUnavailableError)

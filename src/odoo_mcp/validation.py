@@ -4,9 +4,10 @@ Odoo enforces access rights itself. This layer narrows the surface further:
 only allowlisted models, known fields, a small domain grammar and bounded sizes.
 """
 
+import datetime
 import math
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Container, Mapping, Sequence
 from typing import Any
 
 FieldMap = Mapping[str, Mapping[str, Any]]
@@ -45,6 +46,17 @@ ID_ONLY_OPERATORS = frozenset({"=", "!=", "in", "not in"})
 
 Scalar = str | int | float | bool | None
 
+# Writes: only plain field types; x2many writes only as link commands on many2many.
+MAX_WRITE_FIELDS = 100
+MAX_WRITE_STRING = 100_000
+TEXT_TYPES = frozenset({"char", "text", "html", "selection"})
+WRITABLE_TYPES = TEXT_TYPES | {
+    "integer", "float", "monetary", "boolean", "date", "datetime", "many2one", "many2many"
+}  # fmt: skip
+# Command.link (4, id), Command.unlink (3, id), Command.set (6, 0, ids). Never create,
+# update, delete or clear-and-delete commands: those change or remove other records.
+M2M_COMMANDS = frozenset({3, 4, 6})
+
 
 class InputError(ValueError):
     """Client input that violates the gateway's rules. Safe to show to the client."""
@@ -55,7 +67,7 @@ def _short(value: object) -> str:
     return text if len(text) <= 60 else text[:57] + "..."
 
 
-def check_model(model: str, allowed: Sequence[str]) -> None:
+def check_model(model: str, allowed: Container[str]) -> None:
     if model not in allowed:
         raise InputError(
             f"Model {_short(model)} is not allowed. Use list_models to see the allowed models."
@@ -110,7 +122,7 @@ def validate_fields(fields: Sequence[str] | None, available: FieldMap) -> list[s
     return unique
 
 
-def validate_order(order: str | None, available: FieldMap, allowed: Sequence[str]) -> str | None:
+def validate_order(order: str | None, available: FieldMap, allowed: Container[str]) -> str | None:
     if order is None:
         return None
     parts = [part.strip() for part in order.split(",")]
@@ -178,7 +190,7 @@ async def _check_path(
     path: str,
     model: str,
     fields_of: FieldsLookup,
-    allowed: Sequence[str],
+    allowed: Container[str],
     operator: str,
     value: object,
 ) -> None:
@@ -211,7 +223,7 @@ async def validate_domain(
     domain: object,
     model: str,
     fields_of: FieldsLookup,
-    allowed: Sequence[str],
+    allowed: Container[str],
 ) -> list[Any]:
     """Validate an Odoo domain in prefix notation and return it as plain lists."""
     if domain is None:
@@ -265,3 +277,96 @@ def _check_arity(domain: Sequence[object]) -> None:
             operands -= arity - 1
         else:
             operands += 1
+
+
+def _is_positive_id(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _check_m2m(value: object) -> bool:
+    if not isinstance(value, list) or len(value) > MAX_LIST_VALUES:
+        return False
+    for command in value:
+        if not isinstance(command, list) or not command or command[0] not in M2M_COMMANDS:
+            return False
+        code = command[0]
+        if code in (3, 4) and not (len(command) == 2 and _is_positive_id(command[1])):
+            return False
+        if code == 6 and not (
+            len(command) == 3
+            and command[1] == 0
+            and isinstance(command[2], list)
+            and len(command[2]) <= MAX_LIST_VALUES
+            and all(_is_positive_id(i) for i in command[2])
+        ):
+            return False
+    return True
+
+
+def _check_date(value: str, fmt: str) -> bool:
+    try:
+        datetime.datetime.strptime(value, fmt)  # Odoo dates are naive UTC
+    except ValueError:
+        return False
+    return True
+
+
+def _value_ok(kind: str, value: object) -> bool:
+    if kind in TEXT_TYPES:
+        return value is False or (isinstance(value, str) and len(value) <= MAX_WRITE_STRING)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind in ("float", "monetary"):
+        return (
+            isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+        )
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "date":
+        return value is False or (isinstance(value, str) and _check_date(value, "%Y-%m-%d"))
+    if kind == "datetime":
+        return value is False or (
+            isinstance(value, str) and _check_date(value, "%Y-%m-%d %H:%M:%S")
+        )
+    if kind == "many2one":
+        return value is False or _is_positive_id(value)
+    if kind == "many2many":
+        return _check_m2m(value)
+    return False  # pragma: no cover - WRITABLE_TYPES guards this
+
+
+_EXPECTED = {
+    "integer": "an integer",
+    "float": "a number",
+    "monetary": "a number",
+    "boolean": "true or false",
+    "date": "a date 'YYYY-MM-DD' or false",
+    "datetime": "a UTC datetime 'YYYY-MM-DD HH:MM:SS' or false",
+    "many2one": "a record id or false",
+    "many2many": "a list of commands: [4, id] link, [3, id] unlink, [6, 0, [ids]] replace",
+}
+
+
+def validate_values(values: Mapping[str, object], available: FieldMap) -> dict[str, Any]:
+    """Validate field values for create/write against the model's fields."""
+    if not isinstance(values, Mapping) or not values:
+        raise InputError("values must be an object with at least one field")
+    if len(values) > MAX_WRITE_FIELDS:
+        raise InputError(f"values may set at most {MAX_WRITE_FIELDS} fields")
+    result: dict[str, Any] = {}
+    for name, value in values.items():
+        meta = available.get(name)
+        if meta is None:
+            raise InputError(
+                f"Unknown field {_short(name)}. Use get_fields to see the available fields."
+            )
+        kind = str(meta.get("type"))
+        if meta.get("readonly") or name == "id":
+            raise InputError(f"Field {name} is read-only and cannot be set")
+        if kind not in WRITABLE_TYPES:
+            raise InputError(f"Field {name} has type {kind}, which this server does not write")
+        if not _value_ok(kind, value):
+            expected = _EXPECTED.get(kind, "a string (max 100000 characters) or false")
+            raise InputError(f"Field {name} expects {expected}")
+        result[name] = value
+    return result

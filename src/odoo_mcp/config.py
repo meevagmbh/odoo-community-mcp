@@ -10,7 +10,7 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-MODEL_NAME = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
+from odoo_mcp.access import ModelAccess
 
 CommaList = Annotated[tuple[str, ...], NoDecode]
 
@@ -28,7 +28,10 @@ class Settings(BaseSettings):
         description="Base URL of the Odoo instance, e.g. https://odoo.example.com"
     )
     odoo_db: str = Field(min_length=1, max_length=63, pattern=r"^[A-Za-z0-9_.-]+$")
-    odoo_models: CommaList = Field(description="Comma-separated allowlist of Odoo models")
+    odoo_models: CommaList = Field(
+        description="Comma-separated model allowlist: 'model', 'model:rw' or 'prefix.*:rw'"
+    )
+    odoo_mcp_allow_write: bool = False
     odoo_timeout_seconds: float = Field(default=30, gt=0, le=300)
     odoo_allow_insecure_http: bool = False
     odoo_max_response_bytes: int = Field(default=10_000_000, gt=0)
@@ -49,12 +52,8 @@ class Settings(BaseSettings):
     @field_validator("odoo_models")
     @classmethod
     def _check_models(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("ODOO_MODELS must list at least one model")
-        for model in value:
-            if not MODEL_NAME.fullmatch(model):
-                raise ValueError(f"invalid model name in ODOO_MODELS: {model!r}")
-        return tuple(dict.fromkeys(value))
+        ModelAccess.parse(value, allow_write=True)  # raises ValueError on bad entries
+        return value
 
     @model_validator(mode="after")
     def _check_url(self) -> Settings:
@@ -67,6 +66,10 @@ class Settings(BaseSettings):
                 "a trusted internal network)"
             )
         return self
+
+    def model_access(self) -> ModelAccess:
+        """Per-model access; `rw` entries only count when ODOO_MCP_ALLOW_WRITE is true."""
+        return ModelAccess.parse(self.odoo_models, allow_write=self.odoo_mcp_allow_write)
 
     @property
     def odoo_base_url(self) -> str:

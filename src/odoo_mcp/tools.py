@@ -1,15 +1,16 @@
-"""Read-only MCP tools. Each call runs with the caller's own Odoo API key."""
+"""MCP tools. Each call runs with the caller's own Odoo API key."""
 
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Any
+from collections.abc import Awaitable, Callable, Container
+from typing import Annotated, Any, Protocol
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from odoo_mcp.access import Access, ModelAccess
 from odoo_mcp.auth import extract_bearer, key_digest, key_fingerprint
 from odoo_mcp.config import Settings
 from odoo_mcp.logging_setup import audit
@@ -17,6 +18,7 @@ from odoo_mcp.odoo_client import OdooClient, OdooError
 from odoo_mcp.validation import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
+    MAX_WRITE_FIELDS,
     FieldMap,
     InputError,
     check_model,
@@ -26,15 +28,30 @@ from odoo_mcp.validation import (
     validate_limit,
     validate_offset,
     validate_order,
+    validate_values,
 )
 
-FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "store"]
+FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "readonly", "store"]
+MAX_UPDATE_IDS = 100
+MAX_LISTED_MODELS = 200
 FIELDS_CACHE_SECONDS = 60.0
 FIELDS_CACHE_SIZE = 2_000
 
-READ_ONLY = ToolAnnotations(
-    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
-)
+
+def _hints(title: str, *, read_only: bool, destructive: bool, idempotent: bool) -> ToolAnnotations:
+    """Every tool states all hints explicitly; clients must not have to guess defaults."""
+    return ToolAnnotations(
+        title=title,
+        read_only_hint=read_only,
+        destructive_hint=destructive,
+        idempotent_hint=idempotent,
+        open_world_hint=True,  # talks to an external system (Odoo)
+    )
+
+
+def _read(title: str) -> ToolAnnotations:
+    return _hints(title, read_only=True, destructive=False, idempotent=True)
+
 
 DOMAIN_HELP = """
 `domain` is an Odoo search domain: a JSON list of conditions in prefix (Polish) notation.
@@ -64,10 +81,25 @@ class FieldInfo(BaseModel):
     label: str
     relation: str | None = None
     required: bool = False
+    readonly: bool = False
+
+
+class ModelEntry(BaseModel):
+    model: str
+    access: Access
 
 
 class ModelsResult(BaseModel):
-    models: list[str]
+    models: list[ModelEntry]
+
+
+class CreateResult(BaseModel):
+    id: int = Field(description="Id of the new record")
+
+
+class UpdateResult(BaseModel):
+    ids: list[int]
+    updated: int = Field(description="Number of records written")
 
 
 class FieldsResult(BaseModel):
@@ -122,8 +154,29 @@ def _caller_key(ctx: Context) -> str:
     return key
 
 
+class _Runner(Protocol):
+    async def __call__[T](
+        self,
+        ctx: Context,
+        tool: str,
+        model: str | None,
+        action: Callable[[str], Awaitable[T]],
+        **extra: Any,
+    ) -> T: ...
+
+
+def _count(result: object) -> int | None:
+    if isinstance(result, RecordsResult | CountResult):
+        return result.count
+    if isinstance(result, UpdateResult):
+        return result.updated
+    if isinstance(result, CreateResult):
+        return 1
+    return None
+
+
 def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> None:
-    allowed = settings.odoo_models
+    allowed = settings.model_access()
     cache = _FieldsCache()
 
     async def fields_of(key: str, model: str) -> FieldMap:
@@ -139,7 +192,11 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         return result
 
     async def run[T](
-        ctx: Context, tool: str, model: str | None, action: Callable[[str], Awaitable[T]]
+        ctx: Context,
+        tool: str,
+        model: str | None,
+        action: Callable[[str], Awaitable[T]],
+        **extra: Any,
     ) -> T:
         key = _caller_key(ctx)
         fingerprint = key_fingerprint(key)
@@ -153,6 +210,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
                 model=model,
                 outcome=outcome,
                 duration_ms=round((time.perf_counter() - started) * 1000),
+                **extra,
                 **fields,
             )
 
@@ -166,23 +224,52 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         except OdooError as exc:
             log("odoo_error", odoo_status=exc.status, error=type(exc).__name__)
             raise ToolError(str(exc)) from None
-        count = result.count if isinstance(result, RecordsResult | CountResult) else None
-        log("ok", odoo_status=200 if model is not None else None, result_count=count)
+        log("ok", odoo_status=200 if model is not None else None, result_count=_count(result))
         return result
 
-    @server.tool(annotations=READ_ONLY)
-    async def list_models(ctx: Context) -> ModelsResult:
-        """List the Odoo models this gateway allows. Only these can be queried."""
+    async def expand(key: str, prefix: str) -> list[str] | None:
+        """Concrete model names behind a wildcard, as far as the caller may see ir.model."""
+        payload = {
+            "domain": [["model", "=like", f"{prefix}%"], ["transient", "=", False]],
+            "fields": ["model"],
+            "order": "model",
+            "limit": MAX_LISTED_MODELS,
+        }
+        try:
+            rows = await odoo.call(key, "ir.model", "search_read", payload)
+        except OdooError:
+            return None
+        if not isinstance(rows, list):
+            return None
+        return [r["model"] for r in rows if isinstance(r, dict) and isinstance(r.get("model"), str)]
 
-        async def action(_key: str) -> ModelsResult:
-            return ModelsResult(models=list(allowed))
+    @server.tool(annotations=_read("List allowed models"))
+    async def list_models(ctx: Context) -> ModelsResult:
+        """List the Odoo models this gateway allows and whether each is read-only
+        ("read") or writable ("read-write"). Only these models can be used."""
+
+        async def action(key: str) -> ModelsResult:
+            entries = [ModelEntry(model=m, access=a) for m, a in allowed.exact.items()]
+            seen = set(allowed.exact)
+            for prefix, pattern_access in allowed.patterns.items():
+                names = await expand(key, prefix)
+                if names is None:
+                    entries.append(ModelEntry(model=f"{prefix}*", access=pattern_access))
+                    continue
+                for name in names:
+                    access = allowed.access(name)
+                    if name not in seen and access is not None:
+                        seen.add(name)
+                        entries.append(ModelEntry(model=name, access=access))
+            return ModelsResult(models=entries)
 
         return await run(ctx, "list_models", None, action)
 
-    @server.tool(annotations=READ_ONLY)
+    @server.tool(annotations=_read("Describe model fields"))
     async def get_fields(model: Model, ctx: Context) -> FieldsResult:
         """Describe the fields of an Odoo model: technical name, type, label, related
-        model (for many2one/one2many/many2many) and whether it is required.
+        model (for many2one/one2many/many2many), whether it is required and whether it
+        is read-only (read-only fields cannot be written).
 
         Call this before searching so that domains, field lists and order use exact names."""
 
@@ -195,6 +282,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
                         label=str(meta.get("string", "")),
                         relation=meta.get("relation") or None,
                         required=bool(meta.get("required", False)),
+                        readonly=bool(meta.get("readonly", False)),
                     )
                     for name, meta in raw.items()
                 }
@@ -202,7 +290,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "get_fields", model, action)
 
-    @server.tool(annotations=READ_ONLY, description=_search_description())
+    @server.tool(annotations=_read("Search records"), description=_search_description())
     async def search_records(
         model: Model,
         ctx: Context,
@@ -234,7 +322,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "search_records", model, action)
 
-    @server.tool(annotations=READ_ONLY)
+    @server.tool(annotations=_read("Count records"))
     async def count_records(model: Model, ctx: Context, domain: Domain = None) -> CountResult:
         """Count the records of an Odoo model that match a domain (same syntax as
         search_records). Use it to size a result before fetching it."""
@@ -250,7 +338,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "count_records", model, action)
 
-    @server.tool(annotations=READ_ONLY)
+    @server.tool(annotations=_read("Read records by id"))
     async def read_records(
         model: Model,
         ids: Annotated[list[int], Field(description="Record ids, e.g. [7, 42] (max 500)")],
@@ -267,8 +355,103 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         return await run(ctx, "read_records", model, action)
 
+    if allowed.any_writable:
+        _register_write_tools(server, odoo, allowed, fields_of, run)
 
-def _records(result: object, available: FieldMap, allowed: Sequence[str]) -> RecordsResult:
+
+Values = Annotated[
+    dict[str, Any],
+    Field(
+        description="Field values, e.g. {'name': 'Acme', 'partner_id': 7}. See tool description."
+    ),
+]
+
+WRITE_HELP = f"""
+`values` maps field names to new values (use get_fields for names, types and read-only flags):
+- char/text/html/selection: a string, or false to clear. Selection takes the technical key.
+- integer, float, monetary: a number. boolean: true or false.
+- date: "YYYY-MM-DD"; datetime: "YYYY-MM-DD HH:MM:SS" in UTC; false clears.
+- many2one: the related record id, e.g. {{"partner_id": 7}}; false clears.
+- many2many: a list of commands: [4, id] adds a link, [3, id] removes a link,
+  [6, 0, [id, ...]] replaces all links. Other commands are refused.
+- one2many, binary, properties and read-only fields cannot be written.
+At most {MAX_WRITE_FIELDS} fields per call. Odoo checks the user's rights and business rules;
+there is no tool to delete records.
+""".strip()
+
+
+def _register_write_tools(
+    server: MCPServer,
+    odoo: OdooClient,
+    allowed: ModelAccess,
+    fields_of: Callable[[str, str], Awaitable[FieldMap]],
+    run: _Runner,
+) -> None:
+    def check_writable(model: str) -> None:
+        if not allowed.can_write(model):
+            raise InputError(
+                f"Model {model} is read-only on this server. "
+                "Use list_models to see which models are writable."
+            )
+
+    @server.tool(
+        annotations=_hints("Create record", read_only=False, destructive=False, idempotent=False),
+        description=(
+            "Create one record in an Odoo model that this server allows writing "
+            "(list_models shows 'read-write'). Returns the new record id. Calling it twice "
+            f"creates two records.\n\n{WRITE_HELP}\n\n"
+            "Example: model='res.partner', values={'name': 'Acme GmbH', 'is_company': true, "
+            "'country_id': 57}."
+        ),
+    )
+    async def create_record(model: Model, values: Values, ctx: Context) -> CreateResult:
+        async def action(key: str) -> CreateResult:
+            check_writable(model)
+            vals = validate_values(values, await fields_of(key, model))
+            result = await odoo.call(key, model, "create", {"vals_list": [vals]})
+            if not (
+                isinstance(result, list)
+                and len(result) == 1
+                and isinstance(result[0], int)
+                and not isinstance(result[0], bool)
+            ):
+                raise OdooError("Odoo returned an unexpected create result.", 200)
+            return CreateResult(id=result[0])
+
+        return await run(ctx, "create_record", model, action, fields=sorted(values))
+
+    @server.tool(
+        annotations=_hints("Update records", read_only=False, destructive=True, idempotent=True),
+        description=(
+            "Write the same field values to existing records of an Odoo model that this "
+            f"server allows writing. Overwrites the current values. At most {MAX_UPDATE_IDS} "
+            f"ids per call.\n\n{WRITE_HELP}\n\n"
+            "Example: model='sale.order', ids=[12], values={'client_order_ref': 'PO-4711'}."
+        ),
+    )
+    async def update_records(
+        model: Model,
+        ids: Annotated[
+            list[int], Field(description=f"Record ids to update (max {MAX_UPDATE_IDS})")
+        ],
+        values: Values,
+        ctx: Context,
+    ) -> UpdateResult:
+        async def action(key: str) -> UpdateResult:
+            check_writable(model)
+            unique = validate_ids(ids)
+            if len(unique) > MAX_UPDATE_IDS:
+                raise InputError(f"update_records accepts at most {MAX_UPDATE_IDS} ids per call")
+            vals = validate_values(values, await fields_of(key, model))
+            result = await odoo.call(key, model, "write", {"ids": unique, "vals": vals})
+            if result is not True:
+                raise OdooError("Odoo returned an unexpected write result.", 200)
+            return UpdateResult(ids=unique, updated=len(unique))
+
+        return await run(ctx, "update_records", model, action, fields=sorted(values))
+
+
+def _records(result: object, available: FieldMap, allowed: Container[str]) -> RecordsResult:
     if not isinstance(result, list) or not all(isinstance(r, dict) for r in result):
         raise OdooError("Odoo returned an unexpected result.", 200)
     # many2one values are [id, display_name]; the name belongs to the related model,

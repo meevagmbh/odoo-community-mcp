@@ -26,9 +26,10 @@ MCP_PATH = "/mcp"
 HEALTH_PATH = "/healthz"
 
 INSTRUCTIONS = (
-    "Read-only access to an Odoo database with the caller's own permissions. "
-    "Start with list_models, then get_fields for a model, then search_records, "
-    "count_records or read_records."
+    "Access to an Odoo database with the caller's own permissions. "
+    "Start with list_models (it shows which models are read-only and which are writable), "
+    "then get_fields for a model, then search_records, count_records or read_records. "
+    "If write tools are listed, confirm changes with the user before calling them."
 )
 
 

@@ -43,9 +43,13 @@ Dependencies are monitored continuously by Dependabot alerts and security update
 - Keys are never stored or logged. Logs contain a short SHA-256 fingerprint only.
 - Requests without a well-formed `Authorization: Bearer` header are rejected with 401
   before any MCP processing.
-- Only allowlisted models are reachable; domains, field names, sort order, limits and
-  body sizes are validated; client-supplied Odoo `context` is never forwarded.
-- Odoo error messages and tracebacks are mapped to fixed messages and never reach clients.
+- Only allowlisted models are reachable, each as read or read-write. Writing is disabled
+  unless the operator enables it; there is no delete operation and no generic method call.
+- Domains, field names, sort order, written values, limits and body sizes are validated;
+  client-supplied Odoo `context` is never forwarded.
+- Odoo errors are mapped to fixed messages. Only for Odoo business errors (validation and
+  user errors) the first line of Odoo's message is added, shortened and with token-like
+  strings removed. Tracebacks never reach clients.
 - No cookies are kept and redirects are not followed when talking to Odoo.
 - The container image is minimal (no shell, no package manager), runs as non-root and
   supports a read-only root filesystem. Releases are signed and carry provenance.

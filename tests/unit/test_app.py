@@ -37,6 +37,7 @@ PARTNER_FIELDS: dict[str, dict[str, Any]] = {
         "relation": "res.users",
         "required": False,
     },
+    "state": {"type": "selection", "string": "State", "required": False, "readonly": True},
 }
 
 ROWS = {
@@ -51,6 +52,7 @@ class FakeOdoo:
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
         self.delay = 0.0
+        self.deny_ir_model = False
 
     async def handler(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -68,8 +70,16 @@ class FakeOdoo:
                     "debug": "Traceback (most recent call last): secret internals",
                 },
             )
-        *_, _model, method = request.url.path.split("/")
+        *_, model, method = request.url.path.split("/")
         body = json.loads(request.content)
+        if model == "ir.model" and self.deny_ir_model:
+            return httpx2.Response(403, json={"name": "odoo.exceptions.AccessError"})
+        if model == "ir.model" and method == "search_read":
+            prefix = body["domain"][0][2].removesuffix("%")
+            names = ["sale.order", "sale.order.line"]
+            return httpx2.Response(
+                200, json=[{"model": n, "name": n} for n in names if n.startswith(prefix)]
+            )
         if method == "fields_get":
             return httpx2.Response(200, json=PARTNER_FIELDS)
         if method == "search_read":
@@ -78,6 +88,12 @@ class FakeOdoo:
             return httpx2.Response(200, json=len(ROWS[key]))
         if method == "read":
             return httpx2.Response(200, json=[r for r in ROWS[key] if r["id"] in body["ids"]])
+        if method == "create":
+            return httpx2.Response(200, json=[42])
+        if method == "write":
+            return httpx2.Response(200, json=True)
+        if method == "search_read" and model == "ir.model":  # pragma: no cover - handled above
+            return httpx2.Response(200, json=[])
         return httpx2.Response(404, json={"name": "werkzeug.exceptions.NotFound"})
 
 
@@ -97,6 +113,9 @@ def odoo() -> FakeOdoo:
 
 
 AppFactory = Callable[..., Starlette]
+
+READ_TOOLS = {"list_models", "get_fields", "search_records", "count_records", "read_records"}
+WRITE_TOOLS = {"create_record", "update_records"}
 
 
 @pytest.fixture
@@ -212,7 +231,7 @@ async def test_lists_read_only_tools(make_app: AppFactory) -> None:
     async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
         tools = (await client.list_tools()).tools
     names = {tool.name for tool in tools}
-    assert names == {"list_models", "get_fields", "search_records", "count_records", "read_records"}
+    assert names == READ_TOOLS
     for tool in tools:
         assert tool.annotations is not None
         assert tool.annotations.read_only_hint is True
@@ -226,7 +245,12 @@ async def test_list_models_returns_allowlist(make_app: AppFactory, odoo: FakeOdo
     async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
         result = await client.call_tool("list_models", {})
     assert not result.is_error
-    assert result.structured_content == {"models": ["res.partner", "res.country"]}
+    assert result.structured_content == {
+        "models": [
+            {"model": "res.partner", "access": "read"},
+            {"model": "res.country", "access": "read"},
+        ]
+    }
     assert odoo.requests == []
 
 
@@ -241,9 +265,10 @@ async def test_get_fields_returns_reduced_metadata(make_app: AppFactory, odoo: F
         "label": "Country",
         "relation": "res.country",
         "required": False,
+        "readonly": False,
     }
     body = json.loads(odoo.requests[0].content)
-    assert body["attributes"] == ["type", "string", "relation", "required", "store"]
+    assert body["attributes"] == ["type", "string", "relation", "required", "readonly", "store"]
 
 
 async def test_search_records_passes_through_callers_key(
@@ -395,3 +420,170 @@ async def test_keys_never_appear_in_logs(
         and e["key_fp"] == key_fingerprint(bad_key)
         for e in events
     )
+
+
+# --- write tools -----------------------------------------------------------
+
+WRITE_SETTINGS = {
+    "odoo_models": "res.partner:rw,res.country,sale.*:rw",
+    "odoo_mcp_allow_write": True,
+}
+
+
+async def test_write_tools_absent_without_switch(make_app: AppFactory) -> None:
+    async with (
+        running(make_app(odoo_models="res.partner:rw")) as app,
+        mcp_client(app, KEY_A) as client,
+    ):
+        names = {tool.name for tool in (await client.list_tools()).tools}
+    assert names == READ_TOOLS
+
+
+async def test_write_tools_absent_without_writable_model(make_app: AppFactory) -> None:
+    async with (
+        running(make_app(odoo_mcp_allow_write=True)) as app,
+        mcp_client(app, KEY_A) as client,
+    ):
+        names = {tool.name for tool in (await client.list_tools()).tools}
+    assert names == READ_TOOLS
+
+
+async def test_every_tool_is_fully_annotated(make_app: AppFactory) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    assert set(tools) == READ_TOOLS | WRITE_TOOLS
+    for tool in tools.values():
+        hints = tool.annotations
+        assert hints is not None, tool.name
+        assert hints.title, tool.name
+        for value in (
+            hints.read_only_hint,
+            hints.destructive_hint,
+            hints.idempotent_hint,
+            hints.open_world_hint,
+        ):
+            assert value is not None, tool.name
+        assert hints.read_only_hint is (tool.name in READ_TOOLS), tool.name
+    assert tools["create_record"].annotations.destructive_hint is False  # type: ignore[union-attr]
+    assert tools["update_records"].annotations.destructive_hint is True  # type: ignore[union-attr]
+    assert tools["update_records"].annotations.idempotent_hint is True  # type: ignore[union-attr]
+    assert tools["create_record"].annotations.idempotent_hint is False  # type: ignore[union-attr]
+
+
+async def test_list_models_shows_access_and_expands_wildcards(make_app: AppFactory) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool("list_models", {})
+    assert result.structured_content == {
+        "models": [
+            {"model": "res.partner", "access": "read-write"},
+            {"model": "res.country", "access": "read"},
+            {"model": "sale.order", "access": "read-write"},
+            {"model": "sale.order.line", "access": "read-write"},
+        ]
+    }
+
+
+async def test_create_record(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "create_record",
+            {"model": "res.partner", "values": {"name": "New", "country_id": 57}},
+        )
+    assert not result.is_error, result.content
+    assert result.structured_content == {"id": 42}
+    create = odoo.requests[-1]
+    assert create.url.path == "/json/2/res.partner/create"
+    assert create.headers["authorization"] == f"bearer {KEY_A}"
+    assert json.loads(create.content) == {"vals_list": [{"name": "New", "country_id": 57}]}
+
+
+async def test_update_records(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "update_records",
+            {"model": "res.partner", "ids": [1, 1, 2], "values": {"email": "a@example.com"}},
+        )
+    assert not result.is_error, result.content
+    assert result.structured_content == {"ids": [1, 2], "updated": 2}
+    write = odoo.requests[-1]
+    assert write.url.path == "/json/2/res.partner/write"
+    assert json.loads(write.content) == {"ids": [1, 2], "vals": {"email": "a@example.com"}}
+
+
+async def test_write_to_read_only_model_is_rejected(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "create_record", {"model": "res.country", "values": {"name": "X"}}
+        )
+    assert result.is_error
+    assert "read-only" in result.content[0].text  # type: ignore[union-attr]
+    assert odoo.requests == []
+
+
+async def test_write_of_readonly_field_is_rejected(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "update_records", {"model": "res.partner", "ids": [1], "values": {"state": "done"}}
+        )
+    assert result.is_error
+    assert all(not r.url.path.endswith("/write") for r in odoo.requests)
+
+
+async def test_update_is_capped(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "update_records",
+            {"model": "res.partner", "ids": list(range(1, 102)), "values": {"name": "x"}},
+        )
+    assert result.is_error
+    assert all(not r.url.path.endswith("/write") for r in odoo.requests)
+
+
+async def test_write_audit_logs_field_names_not_values(
+    make_app: AppFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        await client.call_tool(
+            "update_records",
+            {"model": "res.partner", "ids": [1], "values": {"email": "secret@example.com"}},
+        )
+    events = [r.audit for r in caplog.records if r.name == "odoo_mcp.audit"]
+    write = next(e for e in events if e.get("tool") == "update_records")
+    assert write["outcome"] == "ok"
+    assert write["fields"] == ["email"]
+    assert write["result_count"] == 1
+    assert "secret@example.com" not in json.dumps(events)
+
+
+async def test_list_models_falls_back_to_patterns(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    odoo.deny_ir_model = True
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool("list_models", {})
+    assert result.structured_content is not None
+    assert {"model": "sale.*", "access": "read-write"} in result.structured_content["models"]
+
+
+async def test_write_business_error_reaches_client(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async def reject(request: httpx2.Request) -> httpx2.Response:
+        odoo.requests.append(request)
+        if request.url.path.endswith("/create"):
+            return httpx2.Response(
+                422,
+                json={
+                    "name": "odoo.exceptions.ValidationError",
+                    "message": "The partner must have a name.",
+                    "debug": "Traceback ...",
+                },
+            )
+        return httpx2.Response(200, json=PARTNER_FIELDS)
+
+    app = create_app(settings(**WRITE_SETTINGS), odoo_transport=httpx2.MockTransport(reject))
+    async with running(app), mcp_client(app, KEY_A) as client:
+        result = await client.call_tool(
+            "create_record", {"model": "res.partner", "values": {"email": "x@example.com"}}
+        )
+    assert result.is_error
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "The partner must have a name." in text
+    assert "Traceback" not in text
