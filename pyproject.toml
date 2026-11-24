@@ -1,0 +1,90 @@
+[project]
+name = "odoo-community-mcp"
+version = "0.1.0"
+description = "Stateless MCP gateway for Odoo 20+ that passes each user's own API key through to the JSON-2 API."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.15"
+authors = [{ name = "meeva GmbH" }]
+keywords = ["mcp", "odoo", "model-context-protocol", "erp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3.15",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "mcp==2.3.0",
+  "httpx2==2.16.2",
+  "pydantic==2.14.3",
+  "pydantic-settings==2.16.3",
+  "starlette==1.10.0",
+  "uvicorn==0.54.0",
+]
+
+[project.scripts]
+odoo-community-mcp = "odoo_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/meevagmbh/odoo-community-mcp"
+Issues = "https://github.com/meevagmbh/odoo-community-mcp/issues"
+
+[dependency-groups]
+dev = [
+  "mypy==2.4.1",
+  "pytest==9.2.0",
+  "pytest-cov==7.1.0",
+  "ruff==0.17.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "odoo_mcp"
+
+[tool.uv]
+# Supply-chain cooldown: never resolve a release younger than 7 days (matches Dependabot).
+# For an urgent security fix, override once per package with
+# `uv lock --upgrade-package <pkg> --exclude-newer-package <pkg>=<timestamp>` and say so in the PR.
+exclude-newer = "7 days"
+required-version = ">=0.13.8"
+
+[tool.ruff]
+line-length = 100
+target-version = "py315"
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "B", "UP", "S", "BLE", "A", "C4", "SIM", "RET", "PT",
+  "TRY", "RUF", "ASYNC", "LOG", "G", "PERF", "N",
+]
+ignore = ["TRY003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLR2004"]
+
+[tool.mypy]
+strict = true
+python_version = "3.15"
+packages = ["odoo_mcp"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-ra --strict-markers --strict-config -m 'not integration'"
+markers = ["integration: needs a running Odoo 20 (see tests/integration/README.md)"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["odoo_mcp"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true

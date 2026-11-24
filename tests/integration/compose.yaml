@@ -1,0 +1,32 @@
+# Throwaway Odoo 20 for integration tests. Not for production use.
+name: odoo-mcp-it
+
+services:
+  db:
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  odoo:
+    image: ${ODOO_IMAGE:-odoo:20.0-20261112@sha256:c7352c766b245b3c0e5c7b7a57e7660dde3265872be9566870d44bdb974f44cf}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+    command: ["odoo", "-d", "mcptest", "--db-filter=^mcptest$$", "--no-database-list"]
+    ports:
+      - "127.0.0.1:${ODOO_PORT:-18069}:8069"
+    volumes:
+      - ./seed.py:/seed.py:ro
