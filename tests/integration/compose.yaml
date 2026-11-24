@@ -3,7 +3,7 @@ name: odoo-mcp-it
 
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     environment:
       POSTGRES_USER: odoo
       POSTGRES_PASSWORD: odoo
@@ -17,7 +17,7 @@ services:
       - /var/lib/postgresql/data
 
   odoo:
-    image: ${ODOO_IMAGE:-odoo:20.0}
+    image: ${ODOO_IMAGE:-odoo:20.0-20261112@sha256:c7352c766b245b3c0e5c7b7a57e7660dde3265872be9566870d44bdb974f44cf}
     depends_on:
       db:
         condition: service_healthy
