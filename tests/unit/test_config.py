@@ -30,6 +30,19 @@ def test_model_access_and_write_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not enabled.model_access().can_write("res.partner")
 
 
+def test_delete_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    write_only = make(monkeypatch, ODOO_MODELS="res.partner:rwd", ODOO_MCP_ALLOW_WRITE="true")
+    assert not write_only.odoo_mcp_allow_delete
+    assert not write_only.model_access().can_delete("res.partner")
+    both = make(
+        monkeypatch,
+        ODOO_MODELS="res.partner:rwd",
+        ODOO_MCP_ALLOW_WRITE="true",
+        ODOO_MCP_ALLOW_DELETE="true",
+    )
+    assert both.model_access().can_delete("res.partner")
+
+
 def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = make(monkeypatch)
     assert settings.odoo_timeout_seconds == 30

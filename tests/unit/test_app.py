@@ -8,6 +8,7 @@ from typing import Any
 import anyio
 import httpx2
 import pytest
+from mcp import MCPError
 from mcp_support import http, mcp_client, running
 from starlette.applications import Starlette
 
@@ -97,7 +98,7 @@ class FakeOdoo:
             return httpx2.Response(200, json=[r for r in ROWS[key] if r["id"] in body["ids"]])
         if method == "create":
             return httpx2.Response(200, json=[42])
-        if method == "write":
+        if method in ("write", "unlink"):
             return httpx2.Response(200, json=True)
         if method == "search_read" and model == "ir.model":  # pragma: no cover - handled above
             return httpx2.Response(200, json=[])
@@ -444,6 +445,11 @@ WRITE_SETTINGS = {
     "odoo_models": "res.partner:rw,res.country,sale.*:rw",
     "odoo_mcp_allow_write": True,
 }
+DELETE_SETTINGS = {
+    "odoo_models": "res.partner:rwd,res.country,sale.order:rw",
+    "odoo_mcp_allow_write": True,
+    "odoo_mcp_allow_delete": True,
+}
 
 
 async def test_write_tools_absent_without_switch(make_app: AppFactory) -> None:
@@ -647,16 +653,18 @@ async def test_business_error_text_stays_out_of_logs(
     assert "Jane Roe" not in log
 
 
-@pytest.mark.parametrize("tool", ["create_record", "update_records"])
+@pytest.mark.parametrize("tool", ["create_record", "update_records", "delete_records"])
 async def test_write_timeout_says_outcome_unknown(tool: str) -> None:
     async def slow(request: httpx2.Request) -> httpx2.Response:
-        if request.url.path.endswith(("/create", "/write")):
+        if request.url.path.endswith(("/create", "/write", "/unlink")):
             raise httpx2.ReadTimeout("timed out", request=request)
         return httpx2.Response(200, json=PARTNER_FIELDS)
 
-    app = create_app(settings(**WRITE_SETTINGS), odoo_transport=httpx2.MockTransport(slow))
-    arguments: dict[str, Any] = {"model": "res.partner", "values": {"name": "N"}}
-    if tool == "update_records":
+    app = create_app(settings(**DELETE_SETTINGS), odoo_transport=httpx2.MockTransport(slow))
+    arguments: dict[str, Any] = {"model": "res.partner"}
+    if tool != "delete_records":
+        arguments["values"] = {"name": "N"}
+    if tool != "create_record":
         arguments["ids"] = [1]
     async with running(app), mcp_client(app, KEY_A) as client:
         result = await client.call_tool(tool, arguments)
@@ -672,3 +680,133 @@ async def test_startup_warns_when_rw_is_switched_off(
     caplog.set_level(logging.WARNING)
     create_app(settings(odoo_models="res.partner:rw"))
     assert any("ODOO_MCP_ALLOW_WRITE" in r.getMessage() for r in caplog.records)
+
+
+# --- delete ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"odoo_models": "res.partner:rwd", "odoo_mcp_allow_write": True},
+        {"odoo_models": "res.partner:rwd", "odoo_mcp_allow_delete": True},
+        {
+            "odoo_models": "res.partner:rw",
+            **dict.fromkeys(("odoo_mcp_allow_write", "odoo_mcp_allow_delete"), True),
+        },
+    ],
+)
+async def test_delete_tool_needs_rwd_and_both_switches(
+    make_app: AppFactory, overrides: dict[str, Any]
+) -> None:
+    async with running(make_app(**overrides)) as app, mcp_client(app, KEY_A) as client:
+        names = {tool.name for tool in (await client.list_tools()).tools}
+    assert "delete_records" not in names
+
+
+async def test_delete_tool_annotations(make_app: AppFactory) -> None:
+    async with running(make_app(**DELETE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    hints = tools["delete_records"].annotations
+    assert hints is not None
+    assert hints.title == tools["delete_records"].title == "Delete records"
+    assert hints.read_only_hint is False
+    assert hints.destructive_hint is True
+    assert hints.idempotent_hint is True
+    assert hints.open_world_hint is False
+    assert "cannot be undone" in (tools["delete_records"].description or "")
+
+
+async def test_delete_records(
+    make_app: AppFactory, odoo: FakeOdoo, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    async with running(make_app(**DELETE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool("delete_records", {"model": "res.partner", "ids": [3, 4]})
+    assert not result.is_error, result.content
+    assert result.structured_content == {"deleted": [3, 4], "count": 2}
+    unlink = odoo.requests[-1]
+    assert unlink.url.path == "/json/2/res.partner/unlink"
+    assert unlink.headers["authorization"] == f"bearer {KEY_A}"
+    assert json.loads(unlink.content) == {"ids": [3, 4]}
+    events = [r.audit for r in caplog.records if r.name == "odoo_mcp.audit"]
+    delete = next(e for e in events if e.get("tool") == "delete_records")
+    assert delete["record_ids"] == [3, 4]
+    assert delete["outcome"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "fragment"),
+    [
+        ({"model": "sale.order", "ids": [1]}, "cannot be deleted"),
+        ({"model": "res.country", "ids": [1]}, "cannot be deleted"),
+        ({"model": "res.partner", "ids": list(range(1, 22))}, "at most 20"),
+    ],
+)
+async def test_delete_is_refused(
+    make_app: AppFactory, odoo: FakeOdoo, arguments: dict[str, Any], fragment: str
+) -> None:
+    async with running(make_app(**DELETE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.call_tool("delete_records", arguments)
+    assert result.is_error
+    assert fragment in result.content[0].text  # type: ignore[union-attr]
+    assert all(not r.url.path.endswith("/unlink") for r in odoo.requests)
+
+
+# --- resources -------------------------------------------------------------
+
+
+async def test_resource_templates_are_listed(make_app: AppFactory) -> None:
+    async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
+        templates = (await client.list_resource_templates()).resource_templates
+    by_uri = {t.uri_template: t for t in templates}
+    assert set(by_uri) == {"odoo://schema/{model}", "odoo://record/{model}/{id}"}
+    for template in templates:
+        assert template.mime_type == "application/json"
+        assert template.title
+        assert template.description
+
+
+async def test_schema_resource(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        result = await client.read_resource("odoo://schema/res.partner")
+    (content,) = result.contents
+    assert content.mime_type == "application/json"
+    data = json.loads(content.text)  # type: ignore[union-attr]
+    assert data["model"] == "res.partner"
+    assert data["access"] == "read-write"
+    assert data["fields"]["country_id"]["relation"] == "res.country"
+    assert odoo.requests[-1].headers["authorization"] == f"bearer {KEY_A}"
+
+
+async def test_record_resource(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    async with running(make_app()) as app, mcp_client(app, KEY_B) as client:
+        result = await client.read_resource("odoo://record/res.partner/3")
+    (content,) = result.contents
+    data = json.loads(content.text)  # type: ignore[union-attr]
+    assert data == {"id": 3, "name": "Also B"}
+    read = odoo.requests[-1]
+    assert read.url.path == "/json/2/res.partner/read"
+    assert json.loads(read.content)["ids"] == [3]
+
+
+@pytest.mark.parametrize(
+    ("uri", "fragment"),
+    [
+        ("odoo://schema/res.users", "not allowed"),
+        ("odoo://record/res.users/1", "not allowed"),
+        ("odoo://record/res.partner/abc", "record id"),
+        ("odoo://record/res.partner/0", "record id"),
+        ("odoo://record/res.partner/99", "not found"),
+    ],
+)
+async def test_resource_errors(
+    make_app: AppFactory, odoo: FakeOdoo, uri: str, fragment: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
+        with pytest.raises(MCPError, match=fragment):
+            await client.read_resource(uri)
+    assert all("res.users" not in r.url.path for r in odoo.requests)
+    sdk_lines = [r.getMessage() for r in caplog.records if r.name.startswith("mcp.")]
+    assert not any(fragment in line for line in sdk_lines)

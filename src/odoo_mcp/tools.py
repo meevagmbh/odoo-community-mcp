@@ -1,12 +1,13 @@
 """MCP tools. Each call runs with the caller's own Odoo API key."""
 
+import json
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Container
 from typing import Annotated, Any, Protocol
 
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
@@ -33,6 +34,7 @@ from odoo_mcp.validation import (
 
 FIELD_ATTRIBUTES = ["type", "string", "relation", "required", "readonly", "store", "related"]
 MAX_UPDATE_IDS = 100
+MAX_DELETE_IDS = 20
 MAX_LISTED_MODELS = 200
 FIELDS_CACHE_SECONDS = 60.0
 FIELDS_CACHE_SIZE = 2_000
@@ -103,6 +105,11 @@ class UpdateResult(BaseModel):
     updated: int = Field(description="Number of records written")
 
 
+class DeleteResult(BaseModel):
+    deleted: list[int]
+    count: int = Field(description="Number of records deleted")
+
+
 class FieldsResult(BaseModel):
     fields: dict[str, FieldInfo]
 
@@ -163,11 +170,12 @@ class _Runner(Protocol):
         model: str | None,
         action: Callable[[str], Awaitable[T]],
         audit_extra: dict[str, Any] | None = None,
+        error: type[Exception] = ...,
     ) -> T: ...
 
 
 def _count(result: object) -> int | None:
-    if isinstance(result, RecordsResult | CountResult):
+    if isinstance(result, RecordsResult | CountResult | DeleteResult):
         return result.count
     if isinstance(result, UpdateResult):
         return result.updated
@@ -198,6 +206,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         model: str | None,
         action: Callable[[str], Awaitable[T]],
         audit_extra: dict[str, Any] | None = None,
+        error: type[Exception] = ToolError,
     ) -> T:
         """Run one tool call; `audit_extra` may be filled by the action (validated data only)."""
         extra = audit_extra if audit_extra is not None else {}
@@ -223,10 +232,10 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
             result = await action(key)
         except InputError as exc:
             log("rejected", reason=str(exc))
-            raise ToolError(str(exc)) from None
+            raise error(str(exc)) from None
         except OdooError as exc:
             log("odoo_error", odoo_status=exc.status, error=type(exc).__name__)
-            raise ToolError(str(exc)) from None
+            raise error(str(exc)) from None
         log("ok", odoo_status=200 if model is not None else None, result_count=_count(result))
         return result
 
@@ -284,19 +293,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
         async def action(key: str) -> FieldsResult:
             raw = await fields_of(key, model)
-            return FieldsResult(
-                fields={
-                    name: FieldInfo(
-                        type=str(meta.get("type", "")),
-                        label=str(meta.get("string", "")),
-                        relation=meta.get("relation") or None,
-                        required=bool(meta.get("required", False)),
-                        # Related fields write elsewhere; this server refuses them.
-                        readonly=bool(meta.get("readonly", False) or meta.get("related")),
-                    )
-                    for name, meta in raw.items()
-                }
-            )
+            return FieldsResult(fields={name: _field_info(meta) for name, meta in raw.items()})
 
         return await run(ctx, "get_fields", model, action)
 
@@ -371,6 +368,7 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
 
     if allowed.any_writable:
         _register_write_tools(server, odoo, allowed, fields_of, run)
+    _register_resources(server, odoo, allowed, fields_of, run)
 
 
 Values = Annotated[
@@ -486,6 +484,107 @@ def _register_write_tools(
             return UpdateResult(ids=unique, updated=len(unique))
 
         return await run(ctx, "update_records", model, action, info)
+
+    if not allowed.any_deletable:
+        return
+
+    @server.tool(
+        title="Delete records",
+        annotations=_hints("Delete records", read_only=False, destructive=True, idempotent=True),
+        description=(
+            "Permanently delete records of an Odoo model that this server allows deleting "
+            "(list_models shows 'read-write-delete'). This cannot be undone, and Odoo may "
+            "also delete dependent records. Confirm with the user first. To hide a record "
+            "reversibly, set its 'active' field to false with update_records instead, if the "
+            f"model has one. At most {MAX_DELETE_IDS} ids per call. Odoo checks the user's "
+            "rights and may refuse (e.g. posted accounting entries)."
+        ),
+    )
+    async def delete_records(
+        model: Model,
+        ids: Annotated[
+            list[int], Field(description=f"Record ids to delete (max {MAX_DELETE_IDS})")
+        ],
+        ctx: Context,
+    ) -> DeleteResult:
+        info: dict[str, Any] = {}
+
+        async def action(key: str) -> DeleteResult:
+            if not allowed.can_delete(model):
+                raise InputError(
+                    f"Records of {model} cannot be deleted on this server. "
+                    "Use list_models to see which models allow deleting."
+                )
+            unique = validate_ids(ids)
+            if len(unique) > MAX_DELETE_IDS:
+                raise InputError(f"delete_records accepts at most {MAX_DELETE_IDS} ids per call")
+            info["record_ids"] = unique
+            result = await write(key, model, "unlink", {"ids": unique})
+            if result is not True:
+                raise OdooError("Odoo returned an unexpected unlink result.", 200)
+            return DeleteResult(deleted=unique, count=len(unique))
+
+        return await run(ctx, "delete_records", model, action, info)
+
+
+def _register_resources(
+    server: MCPServer,
+    odoo: OdooClient,
+    allowed: ModelAccess,
+    fields_of: Callable[[str, str], Awaitable[FieldMap]],
+    run: _Runner,
+) -> None:
+    @server.resource(
+        "odoo://schema/{model}",
+        name="odoo-model-schema",
+        title="Odoo model schema",
+        description=(
+            "Fields of an allowed Odoo model (type, label, relation, required, read-only) "
+            "and this server's access level for it, as seen by your Odoo user."
+        ),
+        mime_type="application/json",
+    )
+    async def model_schema(model: str, ctx: Context) -> str:
+        async def action(key: str) -> str:
+            raw = await fields_of(key, model)
+            fields = {name: _field_info(meta).model_dump() for name, meta in raw.items()}
+            return json.dumps({"model": model, "access": allowed.access(model), "fields": fields})
+
+        return await run(ctx, "resource:schema", model, action, error=ResourceError)
+
+    @server.resource(
+        "odoo://record/{model}/{id}",
+        name="odoo-record",
+        title="Odoo record",
+        description=(
+            "One record of an allowed Odoo model by id, with its stored, non-binary fields, "
+            "e.g. odoo://record/res.partner/7. Only records your Odoo user may read."
+        ),
+        mime_type="application/json",
+    )
+    async def record(model: str, id: str, ctx: Context) -> str:  # noqa: A002 - URI variable
+        async def action(key: str) -> str:
+            if not id.isdigit() or int(id) < 1:
+                raise InputError(f"{id[:20]!r} is not a valid record id")
+            available = await fields_of(key, model)
+            payload = {"ids": [int(id)], "fields": validate_fields(None, available)}
+            records = _records(await odoo.call(key, model, "read", payload), available, allowed)
+            if not records.records:
+                raise InputError(f"Record {model} {id} not found or not visible to you")
+            return json.dumps(records.records[0])
+
+        return await run(ctx, "resource:record", model, action, error=ResourceError)
+
+
+def _field_info(meta: Any) -> FieldInfo:
+    return FieldInfo(
+        type=str(meta.get("type", "")),
+        label=str(meta.get("string", "")),
+        relation=meta.get("relation") or None,
+        required=bool(meta.get("required", False)),
+        # Related fields write elsewhere; this server refuses them.
+        readonly=bool(meta.get("readonly", False) or meta.get("related")),
+    )
 
 
 def _records(result: object, available: FieldMap, allowed: Container[str]) -> RecordsResult:

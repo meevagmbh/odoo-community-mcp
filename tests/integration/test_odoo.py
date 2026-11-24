@@ -6,6 +6,7 @@ from typing import Any
 
 import anyio
 import pytest
+from mcp import MCPError
 from mcp_support import mcp_client, running
 
 from odoo_mcp.app import create_app
@@ -148,8 +149,9 @@ def write_app(seed: dict[str, Any]) -> Any:
         {
             "odoo_url": os.environ["ODOO_IT_URL"],
             "odoo_db": "mcptest",
-            "odoo_models": "res.partner:rw,res.partner.category:rw,res.country,res.country.*",
+            "odoo_models": "res.partner:rwd,res.partner.category:rw,res.country,res.country.*",
             "odoo_mcp_allow_write": True,
+            "odoo_mcp_allow_delete": True,
             "odoo_allow_insecure_http": True,
         }
     )
@@ -240,7 +242,7 @@ async def test_wildcard_shown_as_pattern_without_ir_model_access(
     assert listed.structured_content is not None
     models = {m["model"]: m["access"] for m in listed.structured_content["models"]}
     assert models == {
-        "res.partner": "read-write",
+        "res.partner": "read-write-delete",
         "res.partner.category": "read-write",
         "res.country": "read",
         "res.country.*": "read",
@@ -248,3 +250,43 @@ async def test_wildcard_shown_as_pattern_without_ir_model_access(
     assert not states.is_error, states.content
     assert states.structured_content is not None
     assert states.structured_content["count"] > 0
+
+
+async def test_delete_record(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["alice"]) as client:
+        created = await client.call_tool(
+            "create_record", {"model": "res.partner", "values": {"name": "MCP To Delete"}}
+        )
+        assert created.structured_content is not None
+        partner_id = created.structured_content["id"]
+        deleted = await client.call_tool(
+            "delete_records", {"model": "res.partner", "ids": [partner_id]}
+        )
+        count = await client.call_tool(
+            "count_records", {"model": "res.partner", "domain": [["id", "=", partner_id]]}
+        )
+    assert not deleted.is_error, deleted.content
+    assert deleted.structured_content == {"deleted": [partner_id], "count": 1}
+    assert count.structured_content == {"count": 0}
+
+
+async def test_odoo_enforces_rights_on_delete(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["bob"]) as client:
+        result = await client.call_tool(
+            "delete_records", {"model": "res.partner", "ids": [seed["shared_id"]]}
+        )
+    assert result.is_error
+    assert "permission" in result.content[0].text  # type: ignore[union-attr]
+
+
+async def test_resources(write_app: Any, seed: dict[str, Any]) -> None:
+    async with running(write_app), mcp_client(write_app, seed["keys"]["bob"]) as client:
+        schema = await client.read_resource("odoo://schema/res.partner")
+        record = await client.read_resource(f"odoo://record/res.partner/{seed['shared_id']}")
+        with pytest.raises(MCPError, match=r"no permission|not found or not visible"):
+            await client.read_resource(f"odoo://record/res.partner/{seed['secret_id']}")
+    schema_data = json.loads(schema.contents[0].text)  # type: ignore[union-attr]
+    assert schema_data["access"] == "read-write-delete"
+    assert schema_data["fields"]["name"]["type"] == "char"
+    record_data = json.loads(record.contents[0].text)  # type: ignore[union-attr]
+    assert record_data["name"] == "MCP Shared Partner"
