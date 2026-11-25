@@ -14,10 +14,11 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from odoo_mcp.auth import extract_bearer, key_digest, key_fingerprint
 from odoo_mcp.config import Settings
+from odoo_mcp.keycheck import KeyChecker, Verdict
 from odoo_mcp.logging_setup import audit, install_log_filters
 from odoo_mcp.odoo_client import VERSION, OdooClient
 from odoo_mcp.ratelimit import RateLimiter
@@ -47,25 +48,52 @@ def _json_error(
     )
 
 
-class GatewayMiddleware:
-    """Host/Origin checks, mandatory bearer and per-key rate limit for the MCP path."""
+# Every response is JSON for API clients: no caching (it may hold personal data),
+# no MIME sniffing, no framing, no referrer, no active content.
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"cache-control", b"no-store"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"x-frame-options", b"DENY"),
+    (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
+)
+_SECURITY_HEADER_NAMES = frozenset(name for name, _ in SECURITY_HEADERS)
 
-    def __init__(self, app: ASGIApp, settings: Settings, limiter: RateLimiter) -> None:
+
+class GatewayMiddleware:
+    """Security headers, Host/Origin checks, key check with Odoo and per-key rate limit."""
+
+    def __init__(
+        self, app: ASGIApp, settings: Settings, limiter: RateLimiter, keys: KeyChecker
+    ) -> None:
         self.app = app
         self.settings = settings
         self.limiter = limiter
+        self.keys = keys
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] == HEALTH_PATH:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        response = self._check(scope, Headers(scope=scope))
-        if response is not None:
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
 
-    def _check(self, scope: Scope, headers: Headers) -> Response | None:
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in _SECURITY_HEADER_NAMES
+                ]
+                message["headers"] = [*headers, *SECURITY_HEADERS]
+            await send(message)
+
+        if scope["path"] != HEALTH_PATH:
+            response = await self._check(scope, Headers(scope=scope))
+            if response is not None:
+                await response(scope, receive, send_with_headers)
+                return
+        await self.app(scope, receive, send_with_headers)
+
+    async def _check(self, scope: Scope, headers: Headers) -> Response | None:
         hosts = self.settings.mcp_allowed_hosts
         if hosts and headers.get("host") not in hosts:
             audit("request_rejected", reason="host_not_allowed")
@@ -82,23 +110,41 @@ class GatewayMiddleware:
         key = extract_bearer(headers.get("authorization"))
         if key is None:
             audit("auth_failed", reason="missing_or_malformed_bearer")
+            return _unauthorized("Send your own Odoo API key as 'Authorization: Bearer <key>'.")
+
+        verdict = await self.keys.check(key)
+        if verdict is Verdict.REJECTED:
+            audit("auth_failed", reason="key_rejected", key_fp=key_fingerprint(key))
+            return _unauthorized(
+                "Odoo rejected this API key: it is invalid or expired. Create a new key "
+                "in Odoo under Preferences > Account Security."
+            )
+        if verdict is Verdict.THROTTLED:
+            audit("rate_limited", reason="key_checks", key_fp=key_fingerprint(key))
+            return _too_many(self.keys.retry_after())
+        if verdict is Verdict.UNAVAILABLE:
+            audit("auth_failed", reason="odoo_unavailable", key_fp=key_fingerprint(key))
             return _json_error(
-                401,
-                "unauthorized",
-                "Send your own Odoo API key as 'Authorization: Bearer <key>'.",
-                {"WWW-Authenticate": 'Bearer realm="odoo-mcp"'},
+                503, "unavailable", "Odoo could not check the API key. Try again later."
             )
 
         retry_after = self.limiter.hit(key_digest(key))
         if retry_after:
-            audit("rate_limited", key_fp=key_fingerprint(key))
-            return _json_error(
-                429,
-                "rate_limited",
-                "Too many requests. Slow down.",
-                {"Retry-After": str(retry_after)},
-            )
+            audit("rate_limited", reason="per_key", key_fp=key_fingerprint(key))
+            return _too_many(retry_after)
         return None
+
+
+def _unauthorized(message: str) -> Response:
+    return _json_error(
+        401, "unauthorized", message, {"WWW-Authenticate": 'Bearer realm="odoo-mcp"'}
+    )
+
+
+def _too_many(retry_after: int) -> Response:
+    return _json_error(
+        429, "rate_limited", "Too many requests. Slow down.", {"Retry-After": str(retry_after)}
+    )
 
 
 async def healthz(_request: Request) -> Response:
@@ -158,6 +204,11 @@ def create_app(
                 GatewayMiddleware,
                 settings=settings,
                 limiter=RateLimiter(settings.rate_limit_per_minute),
+                keys=KeyChecker(
+                    odoo,
+                    cache_seconds=settings.auth_cache_seconds,
+                    attempts_per_minute=settings.auth_attempts_per_minute,
+                ),
             )
         ],
         lifespan=lifespan,

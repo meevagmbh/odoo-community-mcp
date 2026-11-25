@@ -21,6 +21,9 @@ except PackageNotFoundError:  # pragma: no cover - only when running from a bare
     VERSION = "0"
 
 USER_AGENT = f"odoo-community-mcp/{VERSION}"
+# Allowed path segments of /json/2/<model>/<method>: no "/", "?", "#", "%" or "..".
+_MODEL_SEGMENT = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*")
+_METHOD_SEGMENT = re.compile(r"[a-z][a-z0-9_]*")
 
 
 class OdooError(Exception):
@@ -136,6 +139,10 @@ class OdooClient:
         await self._transport.aclose()
 
     async def call(self, api_key: str, model: str, method: str, payload: dict[str, Any]) -> Any:
+        # Backstop: callers validate model names, but nothing that could change the
+        # URL path may ever be sent to Odoo.
+        if not (_MODEL_SEGMENT.fullmatch(model) and _METHOD_SEGMENT.fullmatch(method)):
+            raise OdooInvalidRequestError("Invalid model or method name.", None)
         request = httpx2.Request(
             "POST",
             f"{self._base_url}/json/2/{model}/{method}",

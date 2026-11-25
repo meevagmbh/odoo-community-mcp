@@ -11,7 +11,7 @@ from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from odoo_mcp.access import Access, ModelAccess
+from odoo_mcp.access import Access, ModelAccess, model_name_ok
 from odoo_mcp.auth import extract_bearer, key_digest, key_fingerprint
 from odoo_mcp.config import Settings
 from odoo_mcp.logging_setup import audit
@@ -214,12 +214,15 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
         fingerprint = key_fingerprint(key)
         started = time.perf_counter()
 
+        # Only names that passed the syntax check reach the log, never raw client input.
+        logged_model = model if model is not None and model_name_ok(model) else None
+
         def log(outcome: str, **fields: Any) -> None:
             audit(
                 "tool_call",
                 key_fp=fingerprint,
                 tool=tool,
-                model=model,
+                model=logged_model,
                 outcome=outcome,
                 duration_ms=round((time.perf_counter() - started) * 1000),
                 **extra,
@@ -231,7 +234,8 @@ def register_tools(server: MCPServer, settings: Settings, odoo: OdooClient) -> N
                 check_model(model, allowed)
             result = await action(key)
         except InputError as exc:
-            log("rejected", reason=str(exc))
+            # The message may quote client input (search values, names): keep it out of logs.
+            log("rejected", reason="invalid_input")
             raise error(str(exc)) from None
         except OdooError as exc:
             log("odoo_error", odoo_status=exc.status, error=type(exc).__name__)

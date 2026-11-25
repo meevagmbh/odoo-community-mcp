@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     mcp_allowed_origins: CommaList = ()
     mcp_max_body_bytes: int = Field(default=262_144, gt=0)
     rate_limit_per_minute: int = Field(default=120, ge=0)
+    auth_cache_seconds: int = Field(default=60, ge=1, le=300)
+    auth_attempts_per_minute: int = Field(default=60, ge=1)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
     @field_validator("odoo_models", "mcp_allowed_hosts", "mcp_allowed_origins", mode="before")

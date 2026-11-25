@@ -59,8 +59,10 @@ Then ask, for example: *"List the ten newest sale orders of customer Acme."*
 
 ### 3. Revoke a key
 
-In Odoo, **Preferences** → **Account Security** → **API Keys**, delete the key. It stops
-working immediately, also for this server. Remove it from your client configuration too.
+In Odoo, **Preferences** → **Account Security** → **API Keys**, delete the key. Odoo
+refuses it at once; this server caches the result of its key check, so the key stops
+working here after at most `AUTH_CACHE_SECONDS` (default 60 s). Remove it from your client
+configuration too.
 
 ## Tools
 
@@ -119,6 +121,9 @@ docker run -d --name odoo-mcp \
 ```
 
 Put it behind a TLS-terminating reverse proxy and expose only `https://<host>/mcp`.
+The hop from the proxy to the container is plain HTTP, so keep it on the same host or an
+isolated network. Also limit requests per client IP at the proxy: the server's own limits
+are per API key and per process (see [SECURITY.md](SECURITY.md#authentication)).
 `GET /healthz` returns `{"status":"ok"}` without authentication and reveals nothing else.
 Responses are plain JSON (no long-lived SSE streams), so proxies need no special
 buffering settings.
@@ -139,6 +144,8 @@ buffering settings.
 | `MCP_ALLOWED_ORIGINS` | empty (none) | Browser origins allowed to call the server. Requests with any other `Origin` get 403. |
 | `MCP_MAX_BODY_BYTES` | `262144` | Maximum request body. |
 | `RATE_LIMIT_PER_MINUTE` | `120` | Requests per minute per API key (`0` disables). Per process. |
+| `AUTH_CACHE_SECONDS` | `60` | How long Odoo's answer to the key check is cached (1–300). Also the longest a key revoked in Odoo keeps working here. |
+| `AUTH_ATTEMPTS_PER_MINUTE` | `60` | Key checks per minute for keys not in the cache, shared by all callers. Bounds the load that made-up keys put on Odoo. Per process. |
 | `MCP_PORT` | `8000` | Listen port inside the container. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
 
@@ -183,8 +190,10 @@ early-warning run opens an issue, so incompatibilities show up before a release.
 JSON lines on stdout, timestamps in UTC. Every tool call produces an audit event with the
 key fingerprint (first 8 hex chars of SHA-256), tool, model, outcome, Odoo status, result
 count and duration; writes also log the names (not the values) of the written fields.
-API keys and Odoo error texts are never logged; request data is not
-logged either, except a short, truncated excerpt of input the server rejected.
+API keys, Odoo error texts and request data (search values, written values) are never
+logged; rejected input is logged as `"reason": "invalid_input"` without its content.
+Requests stopped before MCP processing produce `auth_failed`, `rate_limited` or
+`request_rejected` events with a `reason` code.
 
 ```json
 {"ts": "2026-11-24T22:05:11.518+00:00", "level": "INFO", "logger": "odoo_mcp.audit", "event": "tool_call", "key_fp": "3f9a1c2b", "tool": "search_records", "model": "res.partner", "outcome": "ok", "odoo_status": 200, "result_count": 12, "duration_ms": 84}
@@ -208,7 +217,7 @@ gh attestation verify oci://ghcr.io/meevagmbh/odoo-community-mcp:<version> --rep
 - **API keys instead of OAuth.** Each user holds an Odoo API key.
 - **SSO-only users.** Odoo asks for the password before it creates a key. Users without a
   password need another way to obtain one, e.g. a key issued by an administrator.
-- **Rate limit per process.** With several replicas the effective limit multiplies.
+- **Rate limits per process.** With several replicas the effective limits multiply.
 
 ## Development
 
