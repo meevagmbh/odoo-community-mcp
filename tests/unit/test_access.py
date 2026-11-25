@@ -1,6 +1,6 @@
 import pytest
 
-from odoo_mcp.access import Access, ModelAccess
+from odoo_mcp.access import MAX_MODEL_LENGTH, Access, ModelAccess
 
 
 def make(spec: str, *, allow_write: bool = True, allow_delete: bool = True) -> ModelAccess:
@@ -109,3 +109,29 @@ def test_delete_needs_an_exact_model_name() -> None:
 def test_invalid_specs(spec: str) -> None:
     with pytest.raises(ValueError, match="ODOO_MODELS"):
         make(spec)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "sale.x/../res.users",
+        "sale.order/unlink",
+        "sale.order?x=1",
+        "sale.order#x",
+        "sale.order\n",
+        "sale.order ",
+        "sale.Order",
+        "sale.",
+        "sale." + "a" * 200,
+        "",
+    ],
+)
+def test_v5_0_0_1_2_2_malformed_names_never_match_a_wildcard(model: str) -> None:
+    access = make("sale.*:rw, sale.order:r")
+    assert access.access(model) is None
+    assert model not in access
+
+
+def test_model_names_up_to_the_length_limit_match() -> None:
+    name = "sale." + "a" * (MAX_MODEL_LENGTH - len("sale."))
+    assert make("sale.*").access(name) is Access.READ

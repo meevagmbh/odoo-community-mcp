@@ -7,7 +7,7 @@ from typing import Any
 import anyio
 import pytest
 from mcp import MCPError
-from mcp_support import mcp_client, running
+from mcp_support import http, mcp_client, running
 
 from odoo_mcp.app import create_app
 from odoo_mcp.config import Settings
@@ -82,11 +82,33 @@ async def test_read_of_forbidden_record_is_a_clean_error(app: Any, seed: dict[st
     assert "Traceback" not in text
 
 
-async def test_invalid_key(app: Any) -> None:
-    async with running(app), mcp_client(app, "0" * 40) as client:
-        result = await client.call_tool("count_records", {"model": "res.partner"})
-    assert result.is_error
-    assert "invalid or expired" in result.content[0].text  # type: ignore[union-attr]
+INIT = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    },
+}
+
+
+async def post_init(app: Any, key: str) -> int:
+    headers = {"Accept": "application/json, text/event-stream", "Authorization": f"Bearer {key}"}
+    async with running(app), http(app, headers) as client:
+        return (await client.post("/mcp", json=INIT)).status_code
+
+
+async def test_v5_0_0_6_3_4_invalid_key_is_rejected_before_any_mcp_method(app: Any) -> None:
+    assert await post_init(app, "0" * 40) == 401
+
+
+@pytest.mark.parametrize("user", ["alice", "bob"])
+async def test_key_check_accepts_internal_and_portal_users(
+    app: Any, seed: dict[str, Any], user: str
+) -> None:
+    assert await post_init(app, seed["keys"][user]) == 200
 
 
 async def test_fields_count_and_relation_path(app: Any, seed: dict[str, Any]) -> None:

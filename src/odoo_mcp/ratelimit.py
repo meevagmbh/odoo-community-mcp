@@ -28,6 +28,13 @@ class RateLimiter:
     def tracked_keys(self) -> int:
         return len(self._hits)
 
+    def retry_after(self, key: str) -> int:
+        """Seconds until `key` may make its next request (0 if it may now)."""
+        window = self._hits.get(key)
+        if self._limit <= 0 or not window or len(window) < self._limit:
+            return 0
+        return max(1, math.ceil(window[0] + WINDOW_SECONDS - self._clock()))
+
     def hit(self, key: str) -> int:
         """Record one request. Return 0 if allowed, else seconds until retry."""
         if self._limit <= 0:

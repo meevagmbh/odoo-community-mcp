@@ -54,6 +54,31 @@ ROWS = {
 }
 
 
+KEY_CHECK = ("res.users", "context_get")
+
+
+def unauthorized() -> httpx2.Response:
+    return httpx2.Response(
+        401,
+        json={
+            "name": "werkzeug.exceptions.Unauthorized",
+            "message": "Invalid apikey",
+            "arguments": ["Invalid apikey", 401],
+            "context": {},
+            "debug": "Traceback (most recent call last): secret internals",
+        },
+    )
+
+
+def odoo_calls(odoo: FakeOdoo) -> list[httpx2.Request]:
+    """Requests to Odoo other than the key check."""
+    return [r for r in odoo.requests if tuple(r.url.path.split("/")[-2:]) != KEY_CHECK]
+
+
+def key_checks(odoo: FakeOdoo) -> list[httpx2.Request]:
+    return [r for r in odoo.requests if tuple(r.url.path.split("/")[-2:]) == KEY_CHECK]
+
+
 class FakeOdoo:
     """Answers JSON-2 calls like Odoo would, per bearer key."""
 
@@ -61,6 +86,10 @@ class FakeOdoo:
         self.requests: list[httpx2.Request] = []
         self.delay = 0.0
         self.deny_ir_model = False
+        # Keys that pass the key check but that Odoo rejects afterwards (revoked meanwhile).
+        self.revoked: set[str] = set()
+        # Status code the key check answers with instead of 200, e.g. 503.
+        self.key_check_status = 200
 
     async def handler(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -68,17 +97,14 @@ class FakeOdoo:
             await anyio.sleep(self.delay)
         key = request.headers["authorization"].removeprefix("bearer ")
         if key not in ROWS:
-            return httpx2.Response(
-                401,
-                json={
-                    "name": "werkzeug.exceptions.Unauthorized",
-                    "message": "Invalid apikey",
-                    "arguments": ["Invalid apikey", 401],
-                    "context": {},
-                    "debug": "Traceback (most recent call last): secret internals",
-                },
-            )
+            return unauthorized()
         *_, model, method = request.url.path.split("/")
+        if (model, method) == KEY_CHECK:
+            if self.key_check_status != 200:
+                return httpx2.Response(self.key_check_status, text="unavailable")
+            return httpx2.Response(200, json={"lang": "en_US", "tz": "UTC"})
+        if key in self.revoked:
+            return unauthorized()
         body = json.loads(request.content)
         if model == "ir.model" and self.deny_ir_model:
             return httpx2.Response(403, json={"name": "odoo.exceptions.AccessError"})
@@ -229,7 +255,7 @@ async def test_oversized_body_is_rejected(make_app: AppFactory, odoo: FakeOdoo) 
     async with running(make_app()) as app, http(app, headers) as client:
         response = await client.post("/mcp", json=big)
     assert response.status_code == 413
-    assert odoo.requests == []
+    assert odoo_calls(odoo) == []
 
 
 # --- MCP tools -------------------------------------------------------------
@@ -259,7 +285,7 @@ async def test_list_models_returns_allowlist(make_app: AppFactory, odoo: FakeOdo
             {"model": "res.country", "access": "read"},
         ]
     }
-    assert odoo.requests == []
+    assert odoo_calls(odoo) == []
 
 
 async def test_get_fields_returns_reduced_metadata(make_app: AppFactory, odoo: FakeOdoo) -> None:
@@ -275,7 +301,7 @@ async def test_get_fields_returns_reduced_metadata(make_app: AppFactory, odoo: F
         "required": False,
         "readonly": False,
     }
-    body = json.loads(odoo.requests[0].content)
+    body = json.loads(odoo_calls(odoo)[0].content)
     assert body["attributes"] == [
         "type",
         "string",
@@ -370,7 +396,7 @@ async def test_model_outside_allowlist_is_rejected_without_calling_odoo(
         result = await client.call_tool("search_records", {"model": "res.users"})
     assert result.is_error
     assert "not allowed" in result.content[0].text  # type: ignore[union-attr]
-    assert odoo.requests == []
+    assert odoo_calls(odoo) == []
 
 
 async def test_invalid_domain_is_a_tool_error(make_app: AppFactory) -> None:
@@ -389,15 +415,180 @@ async def test_client_context_is_never_forwarded(make_app: AppFactory, odoo: Fak
         assert "context" not in json.loads(request.content)
 
 
-async def test_invalid_key_gives_clear_tool_error_without_traceback(make_app: AppFactory) -> None:
+async def test_v5_0_0_6_3_4_unknown_key_is_rejected_before_any_mcp_method(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
     bad_key = "f" * 40
-    async with running(make_app()) as app, mcp_client(app, bad_key) as client:
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {bad_key}"}
+    async with running(make_app()) as app, http(app, headers) as client:
+        response = await client.post("/mcp", json=INIT)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"].startswith("Bearer")
+    assert "invalid or expired" in response.json()["message"]
+    assert "Traceback" not in response.text
+    assert bad_key not in response.text
+    assert odoo_calls(odoo) == []
+
+
+async def test_v5_0_0_6_3_4_list_models_needs_a_key_odoo_accepts(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
+        await client.call_tool("list_models", {})
+    assert len(key_checks(odoo)) == 1
+    assert key_checks(odoo)[0].headers["authorization"] == f"bearer {KEY_A}"
+
+
+async def test_verified_key_is_checked_once_per_cache_period(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {KEY_A}"}
+    async with running(make_app()) as app, http(app, headers) as client:
+        for _ in range(3):
+            assert (await client.post("/mcp", json=INIT)).status_code == 200
+    assert len(key_checks(odoo)) == 1
+
+
+async def test_rejected_key_is_not_checked_again(make_app: AppFactory, odoo: FakeOdoo) -> None:
+    headers = {**MCP_HEADERS, "Authorization": "Bearer " + "f" * 40}
+    async with running(make_app()) as app, http(app, headers) as client:
+        codes = [(await client.post("/mcp", json=INIT)).status_code for _ in range(3)]
+    assert codes == [401, 401, 401]
+    assert len(odoo.requests) == 1
+
+
+async def test_v5_0_0_2_4_1_rotating_unknown_keys_is_throttled(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    async with running(make_app(auth_attempts_per_minute=2)) as app, http(app, MCP_HEADERS) as c:
+        codes = []
+        for i in range(4):
+            key = f"{i:x}" * 40
+            response = await c.post("/mcp", json=INIT, headers={"Authorization": f"Bearer {key}"})
+            codes.append(response.status_code)
+        known = await c.post("/mcp", json=INIT, headers={"Authorization": f"Bearer {KEY_A}"})
+    assert codes == [401, 401, 429, 429]
+    assert len(odoo.requests) == 2
+    assert known.status_code == 429
+
+
+async def test_v5_0_0_2_4_1_throttle_spares_keys_already_verified(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    async with running(make_app(auth_attempts_per_minute=1)) as app, http(app, MCP_HEADERS) as c:
+        first = await c.post("/mcp", json=INIT, headers={"Authorization": f"Bearer {KEY_A}"})
+        bad = await c.post("/mcp", json=INIT, headers={"Authorization": "Bearer " + "f" * 40})
+        again = await c.post("/mcp", json=INIT, headers={"Authorization": f"Bearer {KEY_A}"})
+    assert (first.status_code, bad.status_code, again.status_code) == (200, 429, 200)
+    assert int(bad.headers["retry-after"]) >= 1
+
+
+async def test_key_check_failure_is_503_and_not_cached(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {KEY_A}"}
+    async with running(make_app()) as app, http(app, headers) as client:
+        odoo.key_check_status = 503
+        down = await client.post("/mcp", json=INIT)
+        odoo.key_check_status = 200
+        up = await client.post("/mcp", json=INIT)
+    assert down.status_code == 503
+    assert up.status_code == 200
+    assert len(key_checks(odoo)) == 2
+
+
+async def test_key_without_rights_for_the_check_still_counts_as_valid(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {KEY_A}"}
+    async with running(make_app()) as app, http(app, headers) as client:
+        odoo.key_check_status = 403
+        response = await client.post("/mcp", json=INIT)
+    assert response.status_code == 200
+
+
+async def test_key_revoked_after_the_check_gives_clear_tool_error(
+    make_app: AppFactory, odoo: FakeOdoo
+) -> None:
+    odoo.revoked.add(KEY_A)
+    async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
         result = await client.call_tool("count_records", {"model": "res.partner"})
     assert result.is_error
     text = result.content[0].text  # type: ignore[union-attr]
     assert "invalid or expired" in text
     assert "Traceback" not in text
-    assert bad_key not in text
+    assert KEY_A not in text
+
+
+SECURITY_HEADERS = {
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-frame-options": "DENY",
+    "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "auth", "status"),
+    [
+        ("GET", "/healthz", None, 200),
+        ("POST", "/mcp", None, 401),
+        ("POST", "/mcp", KEY_A, 200),
+        ("GET", "/docs", KEY_A, 404),
+    ],
+)
+async def test_v5_0_0_3_4_3_to_3_4_6_and_14_3_2_security_headers_on_every_response(
+    make_app: AppFactory, method: str, path: str, auth: str | None, status: int
+) -> None:
+    headers = {**MCP_HEADERS, **({"Authorization": f"Bearer {auth}"} if auth else {})}
+    async with running(make_app()) as app, http(app, headers) as client:
+        response = await client.request(method, path, json=INIT if method == "POST" else None)
+    assert response.status_code == status
+    for name, value in SECURITY_HEADERS.items():
+        assert response.headers.get_list(name) == [value], name
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "sale.x/../res.users",
+        "sale.order/unlink?x=1",
+        "sale.order#frag",
+        "sale.order\n",
+        "sale.order%2f..%2fres.users",
+        "sale." + "a" * 200,
+    ],
+)
+async def test_v5_0_0_1_2_2_wildcard_model_cannot_leave_the_url_path(
+    make_app: AppFactory, odoo: FakeOdoo, model: str
+) -> None:
+    async with (
+        running(make_app(**WRITE_SETTINGS)) as app,
+        mcp_client(app, KEY_A) as client,
+    ):
+        result = await client.call_tool("create_record", {"model": model, "values": {"name": "x"}})
+        search = await client.call_tool("search_records", {"model": model})
+    assert result.is_error
+    assert search.is_error
+    assert odoo_calls(odoo) == []
+
+
+async def test_v5_0_0_14_2_4_rejected_input_stays_out_of_the_audit_log(
+    make_app: AppFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    async with running(make_app(**WRITE_SETTINGS)) as app, mcp_client(app, KEY_A) as client:
+        await client.call_tool(
+            "search_records", {"model": "res.partner", "order": "jane@example.com desc"}
+        )
+        await client.call_tool("search_records", {"model": "sale.jane@example.com"})
+    events = [r.audit for r in caplog.records if r.name == "odoo_mcp.audit"]
+    rejected = [e for e in events if e.get("outcome") == "rejected"]
+    assert len(rejected) == 2
+    assert all(e["reason"] == "invalid_input" for e in rejected)
+    assert rejected[1]["model"] is None
+    assert "jane" not in json.dumps(events)
 
 
 async def test_keys_never_appear_in_logs(
@@ -412,8 +603,8 @@ async def test_keys_never_appear_in_logs(
         async with mcp_client(app, KEY_A) as client:
             await client.call_tool("search_records", {"model": "res.partner"})
             await client.call_tool("search_records", {"model": "res.users"})
-        async with mcp_client(app, bad_key) as client:
-            await client.call_tool("count_records", {"model": "res.partner"})
+        async with http(app, {**MCP_HEADERS, "Authorization": f"Bearer {bad_key}"}) as c:
+            await c.post("/mcp", json=INIT)
         async with http(app, {**MCP_HEADERS, "Authorization": "Bearer " + "d" * 40}) as c:
             await c.post("/mcp", json=INIT)
 
@@ -432,8 +623,8 @@ async def test_keys_never_appear_in_logs(
     assert success["odoo_status"] == 200
     assert any(e["outcome"] == "rejected" and e["model"] == "res.users" for e in events)
     assert any(
-        e["outcome"] == "odoo_error"
-        and e["odoo_status"] == 401
+        e["event"] == "auth_failed"
+        and e["reason"] == "key_rejected"
         and e["key_fp"] == key_fingerprint(bad_key)
         for e in events
     )
@@ -541,7 +732,7 @@ async def test_write_to_read_only_model_is_rejected(make_app: AppFactory, odoo: 
         )
     assert result.is_error
     assert "read-only" in result.content[0].text  # type: ignore[union-attr]
-    assert odoo.requests == []
+    assert odoo_calls(odoo) == []
 
 
 async def test_write_of_readonly_field_is_rejected(make_app: AppFactory, odoo: FakeOdoo) -> None:
@@ -807,6 +998,6 @@ async def test_resource_errors(
     async with running(make_app()) as app, mcp_client(app, KEY_A) as client:
         with pytest.raises(MCPError, match=fragment):
             await client.read_resource(uri)
-    assert all("res.users" not in r.url.path for r in odoo.requests)
+    assert all("res.users" not in r.url.path for r in odoo_calls(odoo))
     sdk_lines = [r.getMessage() for r in caplog.records if r.name.startswith("mcp.")]
     assert not any(fragment in line for line in sdk_lines)

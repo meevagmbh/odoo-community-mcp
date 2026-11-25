@@ -207,3 +207,25 @@ async def test_business_error_message_redacts_bearer_tokens() -> None:
     with pytest.raises(OdooInvalidRequestError) as exc_info:
         await client.call(KEY, "sale.order", "write", {})
     assert KEY not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "method"),
+    [
+        ("res.partner/../res.users", "read"),
+        ("res.partner", "read/../unlink"),
+        ("res.partner?x", "read"),
+        ("res.partner", "_private"),
+        ("Res.Partner", "read"),
+    ],
+)
+async def test_v5_0_0_1_3_6_unsafe_path_segments_never_reach_odoo(model: str, method: str) -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json=[])
+
+    with pytest.raises(OdooInvalidRequestError):
+        await make_client(handler).call(KEY, model, method, {})
+    assert seen == []

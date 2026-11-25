@@ -16,9 +16,17 @@ from collections.abc import Iterable
 from enum import StrEnum
 
 _MODEL = r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+"
+_MODEL_NAME = re.compile(_MODEL)
+# Odoo's ir_model.model column is a varchar; real names are far shorter.
+MAX_MODEL_LENGTH = 128
 _ENTRY = re.compile(
     rf"^(?P<name>{_MODEL}|[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*\.\*)(?::(?P<mode>r|rw|rwd))?$"
 )
+
+
+def model_name_ok(model: str) -> bool:
+    """True for a plain Odoo model name such as `sale.order.line`."""
+    return len(model) <= MAX_MODEL_LENGTH and _MODEL_NAME.fullmatch(model) is not None
 
 
 class Access(StrEnum):
@@ -65,6 +73,10 @@ class ModelAccess:
         return cls(exact, patterns)
 
     def access(self, model: str) -> Access | None:
+        # Client-supplied names end up in the Odoo URL path. Anything that is not a
+        # plain model name ("sale.x/../res.users") must never match a wildcard.
+        if not model_name_ok(model):
+            return None
         if model in self.exact:
             return self.exact[model]
         for prefix, access in self._ordered:
